@@ -895,6 +895,10 @@ bool SpringApp::Update()
 	globalRendering->UpdateWindow();
 	globalRendering->UpdateTimer();
 
+	#ifdef ENABLE_OPENXR
+	CVRManager::GetInstance().BeginFrame();
+	#endif
+
 	#if 0
 	if (activeController == nullptr)
 		return true;

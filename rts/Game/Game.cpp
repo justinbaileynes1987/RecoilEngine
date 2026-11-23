@@ -33,6 +33,9 @@
 #include "ExternalAI/EngineOutHandler.h"
 #include "ExternalAI/SkirmishAIHandler.h"
 #include "Rendering/WorldDrawer.h"
+#ifdef ENABLE_OPENXR
+#include "Rendering/VR/VRManager.h"
+#endif
 #include "Rendering/Env/IWater.h"
 #include "Rendering/Env/WaterRendering.h"
 #include "Rendering/Env/MapRendering.h"
@@ -1502,6 +1505,14 @@ bool CGame::Draw() {
 		// minimap never covers entire screen when maximized unless map aspect-ratio matches screen
 		// (unlikely);
 		worldDrawer.GenerateIBLTextures();
+
+		#ifdef ENABLE_OPENXR
+		// draw the world once per eye for the headset, before the desktop view
+		CVRManager::GetInstance().DrawEyes([this]() {
+			worldDrawer.Draw();
+			worldDrawer.ResetMVPMatrices();
+		});
+		#endif
 
 		// restore back to the default FBO / Viewport
 		if (FBO::IsSupported())

@@ -3,6 +3,7 @@
 #ifndef VR_MANAGER_H
 #define VR_MANAGER_H
 
+#include <functional>
 #include <memory>
 
 /**
@@ -12,9 +13,11 @@
  * Compiled only into engine-legacy when ENABLE_OPENXR is set, and does
  * nothing at runtime unless the VREnable config is true.
  *
- * Milestone 0 shows the finished desktop frame on a world-locked quad
- * in the headset, which proves the loader, session, swapchain and frame
- * loop before stereo rendering is attempted.
+ * Per main-loop iteration:
+ *   BeginFrame()  - waits for the headset, starts an OpenXR frame, locates the eyes
+ *   DrawEyes()    - (in-game only) draws the world once per eye into the eye swapchains
+ *   EndOfFrame()  - mirrors the finished desktop frame onto a floating panel and
+ *                   submits the panel plus (if drawn) the stereo world
  */
 class CVRManager
 {
@@ -26,11 +29,21 @@ public:
 	/// Call while the GL context is still alive.
 	void Kill();
 
+	/// Call at the start of each main-loop iteration, before any game update or drawing.
+	void BeginFrame();
+
+	/**
+	 * Call from the game's draw, before the desktop world is drawn. Draws the
+	 * world once per eye from the player camera's position, offset by the
+	 * tracked head pose, and copies each result into that eye's swapchain.
+	 * @param drawWorld draws the world into the default framebuffer using the
+	 *        active camera (normally CWorldDrawer::Draw + ResetMVPMatrices)
+	 */
+	void DrawEyes(const std::function<void()>& drawWorld);
+
 	/**
 	 * Call once per main-loop iteration, just before the desktop swap.
-	 * Polls OpenXR events and, if a session is running, submits the
-	 * current back buffer to the headset.
-	 * @param haveFrame whether a new frame was drawn this iteration
+	 * @param haveFrame whether a new desktop frame was drawn this iteration
 	 */
 	void EndOfFrame(bool haveFrame);
 

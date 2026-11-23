@@ -264,6 +264,19 @@ public:
 	float3 posOffset;
 	float3 tiltOffset;
 
+	// Zero-K VR: per-eye override, unsynced/render-only. While active, Update()
+	// keeps these axes instead of deriving them from rot, and the perspective
+	// projection uses tanFov = (left, right, down, up) tangents (left and down
+	// are negative), allowing the off-axis frustums headsets require.
+	struct VROverride {
+		bool active = false;
+		float3 forward;
+		float3 right;
+		float3 up;
+		float4 tanFov;
+	};
+	VROverride vrOverride;
+
 	float fov         = 0.0f;  ///< vertical viewing angle, in degrees
 	float halfFov     = 0.0f;  ///< half the fov in radians
 	float tanHalfFov  = 0.0f;  ///< math::tan(halfFov)

@@ -3,13 +3,19 @@
 #include "VRManager.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
+#include "Game/Camera.h"
+#include "Game/CameraHandler.h"
 #include "Rendering/GL/myGL.h"
 #include "Rendering/GlobalRendering.h"
+#include "Rendering/UniformConstants.h"
 #include "System/Config/ConfigHandler.h"
 #include "System/Log/ILog.h"
+#include "System/float3.h"
+#include "System/float4.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 	#define WIN32_LEAN_AND_MEAN
@@ -26,8 +32,33 @@
 #include <openxr/openxr_platform.h>
 
 CONFIG(bool, VREnable).defaultValue(false).description("Zero-K VR: start an OpenXR session and show the game in a connected headset.");
-CONFIG(float, VRMirrorDistance).defaultValue(1.5f).minimumValue(0.3f).description("Zero-K VR: distance in metres from the starting head position to the mirrored game screen.");
-CONFIG(float, VRMirrorWidth).defaultValue(1.6f).minimumValue(0.1f).description("Zero-K VR: width in metres of the mirrored game screen.");
+CONFIG(bool, VRStereo).defaultValue(true).description("Zero-K VR: draw the battlefield in stereo around the player camera. When off, only the floating desktop panel is shown.");
+CONFIG(float, VRWorldScale).defaultValue(300.0f).minimumValue(1.0f).description("Zero-K VR: game distance units (elmos) per real-world metre of head movement. Larger values make the battlefield look smaller.");
+CONFIG(float, VRMirrorDistance).defaultValue(1.5f).minimumValue(0.3f).description("Zero-K VR: distance in metres from the starting head position to the desktop panel when no stereo view is shown.");
+CONFIG(float, VRMirrorWidth).defaultValue(1.6f).minimumValue(0.1f).description("Zero-K VR: width in metres of the desktop panel when no stereo view is shown.");
+
+
+namespace {
+	constexpr uint32_t NUM_EYES = 2;
+
+	struct ColorSwapchain {
+		XrSwapchain handle = XR_NULL_HANDLE;
+		std::vector<XrSwapchainImageOpenGLKHR> images;
+		int32_t sizeX = 0;
+		int32_t sizeY = 0;
+	};
+
+	// rotate v by unit quaternion q
+	XrVector3f Rotate(const XrQuaternionf& q, const XrVector3f& v)
+	{
+		// v' = v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)
+		const float3 qv = {q.x, q.y, q.z};
+		const float3 vv = {v.x, v.y, v.z};
+		const float3 t = qv.cross(vv) + vv * q.w;
+		const float3 r = vv + qv.cross(t) * 2.0f;
+		return {r.x, r.y, r.z};
+	}
+}
 
 
 struct CVRManager::Impl
@@ -36,15 +67,24 @@ struct CVRManager::Impl
 	XrSystemId systemId = XR_NULL_SYSTEM_ID;
 	XrSession session = XR_NULL_HANDLE;
 	XrSpace localSpace = XR_NULL_HANDLE;
-	XrSwapchain swapchain = XR_NULL_HANDLE;
-	std::vector<XrSwapchainImageOpenGLKHR> images;
-	int32_t swapSizeX = 0;
-	int32_t swapSizeY = 0;
+	int64_t colorFormat = 0;
+
+	ColorSwapchain mirror;
+	ColorSwapchain eyes[NUM_EYES];
 	GLuint blitFBO = 0;
 
 	XrSessionState state = XR_SESSION_STATE_UNKNOWN;
 	bool running = false;
 
+	// per-frame state, valid between BeginFrame and EndOfFrame
+	XrFrameState frameState = {XR_TYPE_FRAME_STATE};
+	XrView views[NUM_EYES] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+	bool frameBegun = false;
+	bool viewsValid = false;
+	bool eyesDrawn = false;
+
+	bool stereo = true;
+	float worldScale = 300.0f;
 	float mirrorDistance = 1.5f;
 	float mirrorWidth = 1.6f;
 
@@ -52,12 +92,15 @@ struct CVRManager::Impl
 
 	bool CreateInstance();
 	bool CreateSession();
-	bool CreateSwapchain();
+	bool ChooseColorFormat();
+	bool CreateColorSwapchain(int32_t sizeX, int32_t sizeY, ColorSwapchain& sc);
+	bool CreateSwapchains();
 	void Destroy();
 
 	void PollEvents();
-	void SubmitMirrorFrame();
-	bool CopyBackBufferToSwapchain();
+	void LocateViews();
+	bool CopyBackBufferTo(ColorSwapchain& sc, int srcX, int srcY, int srcSizeX, int srcSizeY);
+	void SubmitFrame(bool haveFrame);
 };
 
 
@@ -187,7 +230,7 @@ bool CVRManager::Impl::CreateSession()
 }
 
 
-bool CVRManager::Impl::CreateSwapchain()
+bool CVRManager::Impl::ChooseColorFormat()
 {
 	uint32_t formatCount = 0;
 	if (!Check(xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr), "xrEnumerateSwapchainFormats"))
@@ -202,43 +245,86 @@ bool CVRManager::Impl::CreateSwapchain()
 		return false;
 	}
 
-	// the desktop back buffer already holds sRGB-encoded bytes, so an sRGB
-	// swapchain (filled by a raw copy) makes the runtime display them correctly
-	int64_t format = formats[0];
+	// the back buffer already holds sRGB-encoded bytes, so an sRGB swapchain
+	// (filled by a raw copy) makes the runtime display them correctly
+	colorFormat = formats[0];
 	for (const int64_t preferred: {static_cast<int64_t>(GL_SRGB8_ALPHA8), static_cast<int64_t>(GL_RGBA8)}) {
 		if (std::find(formats.begin(), formats.end(), preferred) != formats.end()) {
-			format = preferred;
+			colorFormat = preferred;
 			break;
 		}
 	}
 
-	swapSizeX = globalRendering->winSizeX;
-	swapSizeY = globalRendering->winSizeY;
+	return true;
+}
 
+
+bool CVRManager::Impl::CreateColorSwapchain(int32_t sizeX, int32_t sizeY, ColorSwapchain& sc)
+{
 	XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 	swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-	swapchainInfo.format = format;
+	swapchainInfo.format = colorFormat;
 	swapchainInfo.sampleCount = 1;
-	swapchainInfo.width = static_cast<uint32_t>(swapSizeX);
-	swapchainInfo.height = static_cast<uint32_t>(swapSizeY);
+	swapchainInfo.width = static_cast<uint32_t>(sizeX);
+	swapchainInfo.height = static_cast<uint32_t>(sizeY);
 	swapchainInfo.faceCount = 1;
 	swapchainInfo.arraySize = 1;
 	swapchainInfo.mipCount = 1;
 
-	if (!Check(xrCreateSwapchain(session, &swapchainInfo, &swapchain), "xrCreateSwapchain"))
+	if (!Check(xrCreateSwapchain(session, &swapchainInfo, &sc.handle), "xrCreateSwapchain"))
 		return false;
 
 	uint32_t imageCount = 0;
-	if (!Check(xrEnumerateSwapchainImages(swapchain, 0, &imageCount, nullptr), "xrEnumerateSwapchainImages"))
+	if (!Check(xrEnumerateSwapchainImages(sc.handle, 0, &imageCount, nullptr), "xrEnumerateSwapchainImages"))
 		return false;
 
-	images.assign(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR});
-	if (!Check(xrEnumerateSwapchainImages(swapchain, imageCount, &imageCount, reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data())), "xrEnumerateSwapchainImages"))
+	sc.images.assign(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR});
+	if (!Check(xrEnumerateSwapchainImages(sc.handle, imageCount, &imageCount, reinterpret_cast<XrSwapchainImageBaseHeader*>(sc.images.data())), "xrEnumerateSwapchainImages"))
 		return false;
+
+	sc.sizeX = sizeX;
+	sc.sizeY = sizeY;
+	return true;
+}
+
+
+bool CVRManager::Impl::CreateSwapchains()
+{
+	if (!ChooseColorFormat())
+		return false;
+
+	if (!CreateColorSwapchain(globalRendering->winSizeX, globalRendering->winSizeY, mirror))
+		return false;
+
+	LOG("[VR] panel swapchain %dx%d, format 0x%x", mirror.sizeX, mirror.sizeY, static_cast<unsigned>(colorFormat));
+
+	if (stereo) {
+		uint32_t viewCount = 0;
+		if (!Check(xrEnumerateViewConfigurationViews(instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &viewCount, nullptr), "xrEnumerateViewConfigurationViews"))
+			return false;
+
+		std::vector<XrViewConfigurationView> configViews(viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+		if (!Check(xrEnumerateViewConfigurationViews(instance, systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, viewCount, &viewCount, configViews.data()), "xrEnumerateViewConfigurationViews"))
+			return false;
+
+		if (viewCount != NUM_EYES) {
+			LOG_L(L_ERROR, "[VR] expected %u stereo views, runtime reports %u", NUM_EYES, viewCount);
+			return false;
+		}
+
+		for (uint32_t i = 0; i < NUM_EYES; ++i) {
+			const int32_t sx = static_cast<int32_t>(configViews[i].recommendedImageRectWidth);
+			const int32_t sy = static_cast<int32_t>(configViews[i].recommendedImageRectHeight);
+
+			if (!CreateColorSwapchain(sx, sy, eyes[i]))
+				return false;
+		}
+
+		LOG("[VR] eye swapchains %dx%d (world is drawn at the desktop view size %dx%d, then scaled)",
+			eyes[0].sizeX, eyes[0].sizeY, globalRendering->viewSizeX, globalRendering->viewSizeY);
+	}
 
 	glGenFramebuffers(1, &blitFBO);
-
-	LOG("[VR] mirror swapchain %dx%d, format 0x%x, %u images", swapSizeX, swapSizeY, static_cast<unsigned>(format), imageCount);
 	return true;
 }
 
@@ -250,12 +336,13 @@ void CVRManager::Impl::Destroy()
 		blitFBO = 0;
 	}
 
-	images.clear();
+	for (ColorSwapchain* sc: {&mirror, &eyes[0], &eyes[1]}) {
+		if (sc->handle != XR_NULL_HANDLE)
+			xrDestroySwapchain(sc->handle);
 
-	if (swapchain != XR_NULL_HANDLE) {
-		xrDestroySwapchain(swapchain);
-		swapchain = XR_NULL_HANDLE;
+		*sc = ColorSwapchain();
 	}
+
 	if (localSpace != XR_NULL_HANDLE) {
 		xrDestroySpace(localSpace);
 		localSpace = XR_NULL_HANDLE;
@@ -272,6 +359,9 @@ void CVRManager::Impl::Destroy()
 	systemId = XR_NULL_SYSTEM_ID;
 	state = XR_SESSION_STATE_UNKNOWN;
 	running = false;
+	frameBegun = false;
+	viewsValid = false;
+	eyesDrawn = false;
 }
 
 
@@ -322,16 +412,42 @@ void CVRManager::Impl::PollEvents()
 }
 
 
-bool CVRManager::Impl::CopyBackBufferToSwapchain()
+void CVRManager::Impl::LocateViews()
+{
+	viewsValid = false;
+
+	if (!stereo || eyes[0].handle == XR_NULL_HANDLE)
+		return;
+
+	XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
+	locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	locateInfo.displayTime = frameState.predictedDisplayTime;
+	locateInfo.space = localSpace;
+
+	XrViewState viewState = {XR_TYPE_VIEW_STATE};
+	uint32_t viewCount = 0;
+
+	for (XrView& view: views) {
+		view = {XR_TYPE_VIEW};
+	}
+
+	if (!Check(xrLocateViews(session, &locateInfo, &viewState, NUM_EYES, &viewCount, views), "xrLocateViews"))
+		return;
+
+	viewsValid = (viewCount == NUM_EYES) && ((viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0);
+}
+
+
+bool CVRManager::Impl::CopyBackBufferTo(ColorSwapchain& sc, int srcX, int srcY, int srcSizeX, int srcSizeY)
 {
 	uint32_t imageIndex = 0;
 	XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-	if (!Check(xrAcquireSwapchainImage(swapchain, &acquireInfo, &imageIndex), "xrAcquireSwapchainImage"))
+	if (!Check(xrAcquireSwapchainImage(sc.handle, &acquireInfo, &imageIndex), "xrAcquireSwapchainImage"))
 		return false;
 
 	XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
 	waitInfo.timeout = XR_INFINITE_DURATION;
-	if (!Check(xrWaitSwapchainImage(swapchain, &waitInfo), "xrWaitSwapchainImage"))
+	if (!Check(xrWaitSwapchainImage(sc.handle, &waitInfo), "xrWaitSwapchainImage"))
 		return false;
 
 	GLint prevReadFBO = 0;
@@ -345,12 +461,12 @@ bool CVRManager::Impl::CopyBackBufferToSwapchain()
 	glDisable(GL_FRAMEBUFFER_SRGB);
 
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, blitFBO);
-	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, images[imageIndex].image, 0);
+	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sc.images[imageIndex].image, 0);
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
 
 	glBlitFramebuffer(
-		0, 0, globalRendering->winSizeX, globalRendering->winSizeY,
-		0, 0, swapSizeX, swapSizeY,
+		srcX, srcY, srcX + srcSizeX, srcY + srcSizeY,
+		0, 0, sc.sizeX, sc.sizeY,
 		GL_COLOR_BUFFER_BIT, GL_LINEAR
 	);
 
@@ -364,36 +480,61 @@ bool CVRManager::Impl::CopyBackBufferToSwapchain()
 		glEnable(GL_FRAMEBUFFER_SRGB);
 
 	XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-	return Check(xrReleaseSwapchainImage(swapchain, &releaseInfo), "xrReleaseSwapchainImage");
+	return Check(xrReleaseSwapchainImage(sc.handle, &releaseInfo), "xrReleaseSwapchainImage");
 }
 
 
-void CVRManager::Impl::SubmitMirrorFrame()
+void CVRManager::Impl::SubmitFrame(bool haveFrame)
 {
-	XrFrameWaitInfo frameWaitInfo = {XR_TYPE_FRAME_WAIT_INFO};
-	XrFrameState frameState = {XR_TYPE_FRAME_STATE};
-	if (!Check(xrWaitFrame(session, &frameWaitInfo, &frameState), "xrWaitFrame"))
-		return;
+	XrCompositionLayerProjectionView projViews[NUM_EYES];
+	XrCompositionLayerProjection projection = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+	XrCompositionLayerQuad panel = {XR_TYPE_COMPOSITION_LAYER_QUAD};
 
-	XrFrameBeginInfo frameBeginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
-	if (!Check(xrBeginFrame(session, &frameBeginInfo), "xrBeginFrame"))
-		return;
-
-	XrCompositionLayerQuad quad = {XR_TYPE_COMPOSITION_LAYER_QUAD};
-	const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad)};
+	const XrCompositionLayerBaseHeader* layers[2];
 	uint32_t layerCount = 0;
 
-	if (frameState.shouldRender && CopyBackBufferToSwapchain()) {
-		quad.space = localSpace;
-		quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-		quad.subImage.swapchain = swapchain;
-		quad.subImage.imageRect.offset = {0, 0};
-		quad.subImage.imageRect.extent = {swapSizeX, swapSizeY};
-		quad.subImage.imageArrayIndex = 0;
-		quad.pose.orientation.w = 1.0f;
-		quad.pose.position = {0.0f, 0.0f, -mirrorDistance};
-		quad.size = {mirrorWidth, mirrorWidth * static_cast<float>(swapSizeY) / static_cast<float>(swapSizeX)};
-		layerCount = 1;
+	if (frameState.shouldRender && eyesDrawn) {
+		for (uint32_t i = 0; i < NUM_EYES; ++i) {
+			projViews[i] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+			projViews[i].pose = views[i].pose;
+			projViews[i].fov = views[i].fov;
+			projViews[i].subImage.swapchain = eyes[i].handle;
+			projViews[i].subImage.imageRect.offset = {0, 0};
+			projViews[i].subImage.imageRect.extent = {eyes[i].sizeX, eyes[i].sizeY};
+			projViews[i].subImage.imageArrayIndex = 0;
+		}
+
+		projection.space = localSpace;
+		projection.viewCount = NUM_EYES;
+		projection.views = projViews;
+		layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
+	}
+
+	if (frameState.shouldRender && haveFrame && CopyBackBufferTo(mirror, 0, 0, globalRendering->winSizeX, globalRendering->winSizeY)) {
+		panel.space = localSpace;
+		panel.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+		panel.subImage.swapchain = mirror.handle;
+		panel.subImage.imageRect.offset = {0, 0};
+		panel.subImage.imageRect.extent = {mirror.sizeX, mirror.sizeY};
+		panel.subImage.imageArrayIndex = 0;
+
+		const float aspect = static_cast<float>(mirror.sizeY) / static_cast<float>(mirror.sizeX);
+
+		if (eyesDrawn) {
+			// in-game: a tablet-sized panel below eye level, tilted up towards the
+			// player, so the stereo battlefield stays visible straight ahead
+			constexpr float tiltRad = -35.0f * 3.14159265f / 180.0f;
+			constexpr float panelWidth = 0.6f;
+			panel.pose.orientation = {std::sin(tiltRad * 0.5f), 0.0f, 0.0f, std::cos(tiltRad * 0.5f)};
+			panel.pose.position = {0.0f, -0.45f, -0.7f};
+			panel.size = {panelWidth, panelWidth * aspect};
+		} else {
+			panel.pose.orientation.w = 1.0f;
+			panel.pose.position = {0.0f, 0.0f, -mirrorDistance};
+			panel.size = {mirrorWidth, mirrorWidth * aspect};
+		}
+
+		layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&panel);
 	}
 
 	XrFrameEndInfo frameEndInfo = {XR_TYPE_FRAME_END_INFO};
@@ -432,11 +573,13 @@ void CVRManager::Init()
 		LOG("[VR] using the software cursor while VR is enabled");
 	}
 
+	impl->stereo = configHandler->GetBool("VRStereo");
+	impl->worldScale = configHandler->GetFloat("VRWorldScale");
 	impl->mirrorDistance = configHandler->GetFloat("VRMirrorDistance");
 	impl->mirrorWidth = configHandler->GetFloat("VRMirrorWidth");
 
-	if (impl->CreateInstance() && impl->CreateSession() && impl->CreateSwapchain()) {
-		LOG("[VR] OpenXR session created; waiting for the runtime to start it");
+	if (impl->CreateInstance() && impl->CreateSession() && impl->CreateSwapchains()) {
+		LOG("[VR] OpenXR session created (stereo=%d, worldScale=%.0f); waiting for the runtime to start it", impl->stereo, impl->worldScale);
 		return;
 	}
 
@@ -451,15 +594,114 @@ void CVRManager::Kill()
 }
 
 
-void CVRManager::EndOfFrame(bool haveFrame)
+void CVRManager::BeginFrame()
 {
 	if (impl->instance == XR_NULL_HANDLE)
 		return;
 
 	impl->PollEvents();
 
-	if (impl->running && haveFrame)
-		impl->SubmitMirrorFrame();
+	if (!impl->running || impl->frameBegun)
+		return;
+
+	impl->eyesDrawn = false;
+	impl->viewsValid = false;
+	impl->frameState = {XR_TYPE_FRAME_STATE};
+
+	XrFrameWaitInfo frameWaitInfo = {XR_TYPE_FRAME_WAIT_INFO};
+	if (!impl->Check(xrWaitFrame(impl->session, &frameWaitInfo, &impl->frameState), "xrWaitFrame"))
+		return;
+
+	XrFrameBeginInfo frameBeginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
+	if (!impl->Check(xrBeginFrame(impl->session, &frameBeginInfo), "xrBeginFrame"))
+		return;
+
+	impl->frameBegun = true;
+
+	if (impl->frameState.shouldRender)
+		impl->LocateViews();
+}
+
+
+void CVRManager::DrawEyes(const std::function<void()>& drawWorld)
+{
+	if (!impl->frameBegun || !impl->frameState.shouldRender || !impl->viewsValid)
+		return;
+
+	CCamera* cam = CCameraHandler::GetCamera(CCamera::CAMTYPE_PLAYER);
+
+	const float3 savedPos = cam->GetPos();
+	const float savedFov = cam->GetVFOV();
+
+	// anchor the VR space at the player camera, keeping only its heading so the
+	// horizon stays level: XR +x -> anchorRight, +y -> world up, -z -> anchorFwd
+	float3 anchorFwd = cam->GetForward();
+	anchorFwd.y = 0.0f;
+	if (anchorFwd.SqLength() < 1e-4f) {
+		// looking straight down; use the camera's up vector as the heading
+		anchorFwd = cam->GetUp();
+		anchorFwd.y = 0.0f;
+	}
+	anchorFwd.Normalize();
+
+	const float3 anchorUp = UpVector;
+	const float3 anchorRight = anchorFwd.cross(anchorUp).Normalize();
+
+	const auto ToWorld = [&](const XrVector3f& v) {
+		return (anchorRight * v.x) + (anchorUp * v.y) - (anchorFwd * v.z);
+	};
+
+	bool ok = true;
+
+	for (uint32_t i = 0; i < NUM_EYES && ok; ++i) {
+		const XrPosef& pose = impl->views[i].pose;
+		const XrFovf& fov = impl->views[i].fov;
+
+		CCamera::VROverride& ovr = cam->vrOverride;
+		ovr.active  = true;
+		ovr.forward = ToWorld(Rotate(pose.orientation, {0.0f, 0.0f, -1.0f})).Normalize();
+		ovr.up      = ToWorld(Rotate(pose.orientation, {0.0f, 1.0f,  0.0f})).Normalize();
+		ovr.right   = ToWorld(Rotate(pose.orientation, {1.0f, 0.0f,  0.0f})).Normalize();
+		ovr.tanFov  = float4(std::tan(fov.angleLeft), std::tan(fov.angleRight), std::tan(fov.angleDown), std::tan(fov.angleUp));
+
+		// the culling frustum is symmetric and uses the desktop aspect ratio;
+		// pick a vertical fov wide enough to contain the eye's off-axis frustum
+		const float tanVert = std::max(std::fabs(ovr.tanFov.z), std::fabs(ovr.tanFov.w));
+		const float tanHorz = std::max(std::fabs(ovr.tanFov.x), std::fabs(ovr.tanFov.y));
+		const float aspect = std::max(globalRendering->aspectRatio, 0.01f);
+		const float tanNeeded = std::max(tanVert, tanHorz / aspect);
+		cam->SetVFOV(2.0f * std::atan(tanNeeded) * (180.0f / 3.14159265f));
+
+		cam->SetPos(savedPos + ToWorld(pose.position) * impl->worldScale);
+		cam->Update();
+		UniformConstants::GetInstance().UpdateMatrices();
+
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		cam->LoadViewport();
+
+		drawWorld();
+
+		ok = impl->CopyBackBufferTo(impl->eyes[i], cam->viewport[0], cam->viewport[1], cam->viewport[2], cam->viewport[3]);
+	}
+
+	cam->vrOverride.active = false;
+	cam->SetPos(savedPos);
+	cam->SetVFOV(savedFov);
+	cam->Update();
+	UniformConstants::GetInstance().UpdateMatrices();
+
+	impl->eyesDrawn = ok;
+}
+
+
+void CVRManager::EndOfFrame(bool haveFrame)
+{
+	if (impl->instance == XR_NULL_HANDLE || !impl->frameBegun)
+		return;
+
+	impl->SubmitFrame(haveFrame);
+	impl->frameBegun = false;
+	impl->eyesDrawn = false;
 }
 
 

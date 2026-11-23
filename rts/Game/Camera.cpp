@@ -147,8 +147,15 @@ void CCamera::Update(const UpdateParams& p)
 	// should be set before UpdateMatrices
 	if (p.updateViewRange)
 		UpdateViewRange();
-	if (p.updateDirs)
-		UpdateDirsFromRot(rot);
+	if (p.updateDirs) {
+		if (vrOverride.active) {
+			forward = vrOverride.forward;
+			right   = vrOverride.right;
+			up      = vrOverride.up;
+		} else {
+			UpdateDirsFromRot(rot);
+		}
+	}
 	if (p.updateMats)
 		UpdateMatrices(globalRendering->viewSizeX, globalRendering->viewSizeY, aspectRatio);
 	if (p.updateViewPort)
@@ -596,6 +603,12 @@ float3 CCamera::CalcViewPortCoordinates(const float3& objPos) const
 
 
 inline void CCamera::gluPerspectiveSpring(float aspect, float zn, float zf) {
+	if (vrOverride.active) {
+		const float4& tf = vrOverride.tanFov;
+		projectionMatrix = clipControlMatrix * CMatrix44f::PerspProj(zn * tf.x, zn * tf.y,  zn * tf.z, zn * tf.w,  zn, zf);
+		return;
+	}
+
 	const float t = zn * tanHalfFov;
 	const float b = -t;
 	const float l = b * aspect;
