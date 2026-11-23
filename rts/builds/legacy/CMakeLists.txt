@@ -84,6 +84,16 @@ include_directories(${engineIncludes})
 add_executable(engine-legacy ${EXE_FLAGS} ${engineSources} ${ENGINE_ICON} ${engineHeaders})
 target_link_libraries(engine-legacy ${engineLibraries} Game)
 
+# Zero-K VR: OpenXR support (Windows/OpenGL only for now)
+if (ENABLE_OPENXR)
+	if (NOT WIN32)
+		message(FATAL_ERROR "ENABLE_OPENXR currently supports Windows builds only")
+	endif()
+	target_sources(engine-legacy PRIVATE "${ENGINE_SRC_ROOT_DIR}/Rendering/VR/VRManager.cpp")
+	target_compile_definitions(engine-legacy PRIVATE ENABLE_OPENXR)
+	target_link_libraries(engine-legacy openxr_loader)
+endif()
+
 # Export symbols for plugin access (replaces CMP0065 OLD behavior)
 set_target_properties(engine-legacy PROPERTIES ENABLE_EXPORTS TRUE)
 

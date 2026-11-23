@@ -106,6 +106,10 @@
 #include "Game/SyncedGameCommands.h"
 #include "lib/luasocket/src/restrictions.h"
 
+#ifdef ENABLE_OPENXR
+#include "Rendering/VR/VRManager.h"
+#endif
+
 
 
 CONFIG(unsigned, SetCoreAffinity).defaultValue(0).safemodeValue(1).description("Defines a bitmask indicating which CPU cores the main-thread should use.");
@@ -272,6 +276,10 @@ bool SpringApp::Init()
 	globalRendering->UpdateGLConfigs();
 	globalRendering->UpdateGLGeometry();
 	globalRendering->InitGLState();
+
+	#ifdef ENABLE_OPENXR
+	CVRManager::GetInstance().Init();
+	#endif
 
 	CCameraHandler::InitStatic();
 	CBitmap::InitPool(configHandler->GetInt("TextureMemPoolSize"));
@@ -902,6 +910,10 @@ bool SpringApp::Update()
 	swap = (retc && activeController != nullptr && activeController->Draw());
 	#endif
 
+	#ifdef ENABLE_OPENXR
+	CVRManager::GetInstance().EndOfFrame(swap);
+	#endif
+
 	// always swap by default, not doing so can upset some drivers
 	globalRendering->SwapBuffers(swap, false);
 	return retc;
@@ -1004,6 +1016,11 @@ void SpringApp::Kill(bool fromRun)
 	killedCount += 1;
 
 	LOG("[SpringApp::%s][1] fromRun=%d", __func__, fromRun);
+
+	#ifdef ENABLE_OPENXR
+	CVRManager::GetInstance().Kill();
+	#endif
+
 	ThreadPool::SetThreadCount(0);
 	LOG("[SpringApp::%s][2]", __func__);
 	LuaVFSDownload::Free(true);

@@ -52,3 +52,6 @@
 [submodule "rts/lib/streflop"]
 	path = rts/lib/streflop
 	url = https://github.com/RecoilEngine/streflop.git
+[submodule "rts/lib/openxr"]
+	path = rts/lib/openxr
+	url = https://github.com/KhronosGroup/OpenXR-SDK.git

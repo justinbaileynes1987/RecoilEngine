@@ -665,6 +665,8 @@ add_dependencies(generateSources generateVersionFiles)
 # As the libs are required by all the other sub-projects, we add them first
 # Options that affect lib selection must be declared here, before rts/lib is processed
 option(USE_MIMALLOC "Use mimalloc memory allocator" TRUE)
+# Zero-K VR: OpenXR support in the interactive (legacy) engine; see rts/Rendering/VR
+option(ENABLE_OPENXR "Build engine-legacy with OpenXR (VR) support" FALSE)
 add_subdirectory(rts/lib)
 
 # Fix for MinGW assembler limitations with large object files

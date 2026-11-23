@@ -208,3 +208,18 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND TARGET rmlui_core)
 	# Fixed in GCC 14 -- retest dropping this once CI is off GCC 13.
 	target_compile_options(rmlui_core PRIVATE -Wno-array-bounds)
 endif()
+
+# Zero-K VR: static OpenXR loader for engine-legacy
+if (ENABLE_OPENXR)
+	set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
+	set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
+	set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+	set(BUILD_CONFORMANCE_TESTS OFF CACHE BOOL "" FORCE)
+	set(BUILD_SDK_TESTS OFF CACHE BOOL "" FORCE)
+	set(BUILD_WITH_SYSTEM_JSONCPP OFF CACHE BOOL "" FORCE)
+	string(REPLACE "-fsingle-precision-constant" "" NEW_CMAKE_FLAGS ${CMAKE_CXX_FLAGS})
+	set(SAVED_CMAKE_FLAGS ${CMAKE_CXX_FLAGS})
+	set(CMAKE_CXX_FLAGS ${NEW_CMAKE_FLAGS})
+	add_subdirectory(openxr EXCLUDE_FROM_ALL)
+	set(CMAKE_CXX_FLAGS ${SAVED_CMAKE_FLAGS})
+endif()
