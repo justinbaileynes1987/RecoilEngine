@@ -18,6 +18,7 @@
 	#define NOMINMAX
 #endif
 #include <windows.h>
+#include <unknwn.h> // IUnknown, used by openxr_platform.h on Win32
 
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_OPENGL
