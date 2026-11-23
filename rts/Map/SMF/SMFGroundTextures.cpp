@@ -33,6 +33,7 @@
 #include "System/Threading/ThreadPool.h" // for_mt
 
 #include "System/Misc/TracyDefs.h"
+#include "Rendering/VR/VRState.h"
 
 #define LOG_SECTION_SMF_GROUND_TEXTURES "CSMFGroundTextures"
 LOG_REGISTER_SECTION_GLOBAL(LOG_SECTION_SMF_GROUND_TEXTURES)
@@ -343,6 +344,9 @@ void CSMFGroundTextures::DrawUpdate()
 {
 	RECOIL_DETAILED_TRACY_ZONE;
 	if (!smfTextureStreaming)
+		return;
+	// Zero-K VR: keep the desktop camera's mip choice instead of reloading per eye
+	if (VRState::eyePass)
 		return;
 
 	const CCamera* cam = CCameraHandler::GetActiveCamera();

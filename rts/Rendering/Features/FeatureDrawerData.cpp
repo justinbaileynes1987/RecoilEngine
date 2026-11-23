@@ -12,6 +12,7 @@
 #include "Rendering/Common/ModelDrawerHelpers.h"
 
 #include "System/Misc/TracyDefs.h"
+#include "Rendering/VR/VRState.h"
 
 CONFIG(float, FeatureDrawDistance)
 .defaultValue(6000.0f)
@@ -142,7 +143,8 @@ void CFeatureDrawerData::UpdateObjectDrawFlags(CSolidObject* o) const
 		switch (camType)
 			{
 			case CCamera::CAMTYPE_PLAYER: {
-				const float camDist = (f->drawPos - cam->GetPos()).Length();
+				// Zero-K VR: eye distances are in miniature scale, so skip the distance fade
+				const float camDist = VRState::eyePass ? 0.0f : (f->drawPos - cam->GetPos()).Length();
 
 				// special case for non-fading features
 				if (!f->alphaFade) {

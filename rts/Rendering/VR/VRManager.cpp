@@ -5,11 +5,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "Rendering/GL/myGL.h"
 #include "Rendering/GlobalRendering.h"
 #include "Rendering/UniformConstants.h"
+#include "Rendering/Textures/Bitmap.h"
+#include "Rendering/VR/VRState.h"
 #include "System/Config/ConfigHandler.h"
 #include "System/Log/ILog.h"
 #include "System/float3.h"
@@ -44,6 +47,7 @@ CONFIG(float, VRTableDistance).defaultValue(0.8f).description("Zero-K VR (table 
 CONFIG(float, VRTableHeight).defaultValue(-0.5f).description("Zero-K VR (table view): height in metres of the table surface relative to the starting eye height.");
 CONFIG(float, VRWorldScale).defaultValue(300.0f).minimumValue(1.0f).description("Zero-K VR (camera view): game distance units (elmos) per real-world metre of head movement.");
 CONFIG(float, VRMirrorDistance).defaultValue(1.5f).minimumValue(0.3f).description("Zero-K VR: distance in metres from the starting head position to the desktop panel (UI). In-game with the table view, the panel stands behind the table instead.");
+CONFIG(int, VRDebugCapture).defaultValue(0).minimumValue(0).description("Zero-K VR: if N > 0, save both eye images (vr-eye-0.png, vr-eye-1.png) to the write dir on the Nth frame that draws the eyes, and log the eye positions.");
 CONFIG(float, VRMirrorWidth).defaultValue(1.6f).minimumValue(0.1f).description("Zero-K VR: width in metres of the desktop panel (UI).");
 
 
@@ -100,6 +104,9 @@ struct CVRManager::Impl
 	float worldScale = 300.0f;
 	float mirrorDistance = 1.5f;
 	float mirrorWidth = 1.6f;
+
+	int debugCaptureFrame = 0; // VRDebugCapture
+	int eyeFrames = 0;         // frames on which the eyes were drawn
 
 	bool Check(XrResult result, const char* what) const;
 
@@ -586,6 +593,7 @@ void CVRManager::Init()
 
 	impl->stereo = configHandler->GetBool("VRStereo");
 	impl->tableView = (configHandler->GetString("VRView") != "camera");
+	impl->debugCaptureFrame = configHandler->GetInt("VRDebugCapture");
 	impl->tableSize = configHandler->GetFloat("VRTableSize");
 	impl->tableDistance = configHandler->GetFloat("VRTableDistance");
 	impl->tableHeight = configHandler->GetFloat("VRTableHeight");
@@ -635,6 +643,27 @@ void CVRManager::BeginFrame()
 
 	if (impl->frameState.shouldRender)
 		impl->LocateViews();
+}
+
+
+// debug aid: save a rectangle of the default framebuffer's back buffer as a PNG
+static void CaptureBackBuffer(const std::string& filename, int x, int y, int sizeX, int sizeY)
+{
+	sizeX -= (sizeX % 4);
+	if (sizeX <= 0 || sizeY <= 0)
+		return;
+
+	std::vector<uint8_t> pixels(static_cast<size_t>(sizeX) * sizeY * 4);
+
+	GLint prevReadFBO = 0;
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFBO);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+	glReadPixels(x, y, sizeX, sizeY, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFBO);
+
+	CBitmap bmp(pixels.data(), sizeX, sizeY);
+	bmp.ReverseYAxis();
+	bmp.Save(filename, true, true);
 }
 
 
@@ -695,6 +724,19 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 
 	bool ok = true;
 
+	impl->eyeFrames += 1;
+	const bool captureThisFrame = (impl->debugCaptureFrame > 0 && impl->eyeFrames == impl->debugCaptureFrame);
+	// log the eyes on the first frame, every ~10 s at 90 Hz, and when capturing
+	const bool logThisFrame = (impl->eyeFrames == 1 || (impl->eyeFrames % 900) == 0 || captureThisFrame);
+
+	if (logThisFrame) {
+		const XrVector3f& a = impl->views[0].pose.position;
+		const XrVector3f& b = impl->views[1].pose.position;
+		const float ipd = std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z));
+		LOG("[VR] eye frame %d: view=%s scale=%.0f elmos/m, head=(%.2f, %.2f, %.2f) m, eye separation %.1f mm = %.0f elmos",
+			impl->eyeFrames, impl->tableView ? "table" : "camera", scale, a.x, a.y, a.z, ipd * 1000.0f, ipd * scale);
+	}
+
 	for (uint32_t i = 0; i < NUM_EYES && ok; ++i) {
 		const XrPosef& pose = impl->views[i].pose;
 		const XrFovf& fov = impl->views[i].fov;
@@ -717,15 +759,28 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 		cam->SetPos(ToWorldPos(pose.position));
 		cam->Update();
 
-		// visibility (unit/feature draw flags, ground patches, shadow fit) is
-		// computed in the update step from the active camera; redo it per eye
+		// visibility (unit/feature draw flags, ground patches) is computed in
+		// the update step from the active camera; redo it per eye. Fog
+		// distances (shader params) also come from the player camera.
+		VRState::eyePass = true;
 		updateForCamera();
 		UniformConstants::GetInstance().UpdateMatrices();
+		UniformConstants::GetInstance().UpdateParams();
 
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 		cam->LoadViewport();
 
 		drawWorld();
+
+		if (logThisFrame) {
+			const float3 p = cam->GetPos();
+			const float3 f = cam->GetForward();
+			LOG("[VR] eye %u: pos=(%.0f, %.0f, %.0f) dir=(%.2f, %.2f, %.2f) tanFov=(%.2f, %.2f, %.2f, %.2f) far=%.0f vfov=%.1f viewport=%dx%d",
+				i, p.x, p.y, p.z, f.x, f.y, f.z, ovr.tanFov.x, ovr.tanFov.y, ovr.tanFov.z, ovr.tanFov.w,
+				cam->GetFarPlaneDist(), cam->GetVFOV(), cam->viewport[2], cam->viewport[3]);
+		}
+		if (captureThisFrame)
+			CaptureBackBuffer("vr-eye-" + std::to_string(i) + ".png", cam->viewport[0], cam->viewport[1], cam->viewport[2], cam->viewport[3]);
 
 		ok = impl->CopyBackBufferTo(impl->eyes[i], cam->viewport[0], cam->viewport[1], cam->viewport[2], cam->viewport[3]);
 	}
@@ -735,9 +790,14 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 	cam->SetVFOV(savedFov);
 	cam->Update();
 
-	// restore the desktop camera's visibility for the desktop draw
+	// restore the desktop camera's visibility and params for the desktop draw
+	VRState::eyePass = false;
 	updateForCamera();
 	UniformConstants::GetInstance().UpdateMatrices();
+	UniformConstants::GetInstance().UpdateParams();
+
+	if (captureThisFrame)
+		LOG("[VR] saved vr-eye-0.png and vr-eye-1.png to the write dir");
 
 	impl->eyesDrawn = ok;
 }

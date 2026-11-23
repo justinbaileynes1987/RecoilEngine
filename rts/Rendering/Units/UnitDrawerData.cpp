@@ -33,6 +33,7 @@
 #include "System/MathConstants.h"
 #include "System/Transform.hpp"
 #include "Rendering/Models/ModelsMemStorage.h"
+#include "Rendering/VR/VRState.h"
 
 static FixedDynMemPoolT<MAX_UNITS / 1000, MAX_UNITS / 32, GhostSolidObject> ghostMemPool;
 
@@ -230,7 +231,9 @@ void CUnitDrawerData::Update()
 	const auto updateBody = [this](CUnit* u) {
 		UpdateDrawPos(u);
 
-		if (useScreenIcons)
+		if (VRState::eyePass)
+			u->SetIsIcon(false); // Zero-K VR: icons are screen-space; draw models in the eye views
+		else if (useScreenIcons)
 			UpdateUnitIconStateScreen(u);
 		else
 			UpdateUnitIconState(u);
