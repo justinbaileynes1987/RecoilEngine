@@ -424,6 +424,14 @@ void CVRManager::Init()
 		return;
 	}
 
+	// a hardware cursor is drawn by the OS on top of the window, so it never
+	// reaches the back buffer that is mirrored into the headset; force the
+	// software cursor for this run only (overlay value, not saved to file)
+	if (configHandler->GetBool("HardwareCursor")) {
+		configHandler->Set("HardwareCursor", false, true);
+		LOG("[VR] using the software cursor while VR is enabled");
+	}
+
 	impl->mirrorDistance = configHandler->GetFloat("VRMirrorDistance");
 	impl->mirrorWidth = configHandler->GetFloat("VRMirrorWidth");
 
