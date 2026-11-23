@@ -1512,12 +1512,12 @@ bool CGame::Draw() {
 		// it is redone per eye (and again for the desktop afterwards); the
 		// shadow fit is left alone because the shadow map is already rendered
 		CVRManager::GetInstance().DrawEyes(
-			[]() {
+			[this]() {
 				worldDrawer.Update(false);
 				transformsUploader.Update();
 				modelUniformsUploader.Update();
 			},
-			[]() {
+			[this]() {
 				worldDrawer.Draw();
 				worldDrawer.ResetMVPMatrices();
 			}
