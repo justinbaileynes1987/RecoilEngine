@@ -33,12 +33,18 @@
 // clash with OpenXR struct members of the same name
 #include "Game/Camera.h"
 #include "Game/CameraHandler.h"
+#include "Map/ReadMap.h"
+#include "Sim/Misc/GlobalConstants.h"
 
 CONFIG(bool, VREnable).defaultValue(false).description("Zero-K VR: start an OpenXR session and show the game in a connected headset.");
 CONFIG(bool, VRStereo).defaultValue(true).description("Zero-K VR: draw the battlefield in stereo around the player camera. When off, only the floating desktop panel is shown.");
-CONFIG(float, VRWorldScale).defaultValue(300.0f).minimumValue(1.0f).description("Zero-K VR: game distance units (elmos) per real-world metre of head movement. Larger values make the battlefield look smaller.");
-CONFIG(float, VRMirrorDistance).defaultValue(1.5f).minimumValue(0.3f).description("Zero-K VR: distance in metres from the starting head position to the desktop panel when no stereo view is shown.");
-CONFIG(float, VRMirrorWidth).defaultValue(1.6f).minimumValue(0.1f).description("Zero-K VR: width in metres of the desktop panel when no stereo view is shown.");
+CONFIG(std::string, VRView).defaultValue("table").description("Zero-K VR: 'table' shows the whole map as a miniature on a virtual table; 'camera' views the world from the desktop camera, offset by head movement.");
+CONFIG(float, VRTableSize).defaultValue(1.2f).minimumValue(0.1f).description("Zero-K VR (table view): length in metres of the longest side of the map on the table.");
+CONFIG(float, VRTableDistance).defaultValue(0.8f).description("Zero-K VR (table view): metres from the starting head position to the table centre.");
+CONFIG(float, VRTableHeight).defaultValue(-0.5f).description("Zero-K VR (table view): height in metres of the table surface relative to the starting eye height.");
+CONFIG(float, VRWorldScale).defaultValue(300.0f).minimumValue(1.0f).description("Zero-K VR (camera view): game distance units (elmos) per real-world metre of head movement.");
+CONFIG(float, VRMirrorDistance).defaultValue(1.5f).minimumValue(0.3f).description("Zero-K VR: distance in metres from the starting head position to the desktop panel (UI). In-game with the table view, the panel stands behind the table instead.");
+CONFIG(float, VRMirrorWidth).defaultValue(1.6f).minimumValue(0.1f).description("Zero-K VR: width in metres of the desktop panel (UI).");
 
 
 namespace {
@@ -87,6 +93,10 @@ struct CVRManager::Impl
 	bool eyesDrawn = false;
 
 	bool stereo = true;
+	bool tableView = true;
+	float tableSize = 1.2f;
+	float tableDistance = 0.8f;
+	float tableHeight = -0.5f;
 	float worldScale = 300.0f;
 	float mirrorDistance = 1.5f;
 	float mirrorWidth = 1.6f;
@@ -523,18 +533,16 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 
 		const float aspect = static_cast<float>(mirror.sizeY) / static_cast<float>(mirror.sizeX);
 
-		if (eyesDrawn) {
-			// in-game: a tablet-sized panel below eye level, tilted up towards the
-			// player, so the stereo battlefield stays visible straight ahead
-			constexpr float tiltRad = -35.0f * 3.14159265f / 180.0f;
-			constexpr float panelWidth = 0.6f;
-			panel.pose.orientation = {std::sin(tiltRad * 0.5f), 0.0f, 0.0f, std::cos(tiltRad * 0.5f)};
-			panel.pose.position = {0.0f, -0.45f, -0.7f};
-			panel.size = {panelWidth, panelWidth * aspect};
+		panel.pose.orientation.w = 1.0f;
+		panel.size = {mirrorWidth, mirrorWidth * aspect};
+
+		if (eyesDrawn && tableView) {
+			// in-game: stand the panel upright behind the table, its bottom edge
+			// just above the table surface, like a screen on the war-room wall
+			const float behindTable = tableDistance + tableSize * 0.5f + 0.3f;
+			panel.pose.position = {0.0f, tableHeight + 0.1f + panel.size.height * 0.5f, -std::max(behindTable, mirrorDistance)};
 		} else {
-			panel.pose.orientation.w = 1.0f;
 			panel.pose.position = {0.0f, 0.0f, -mirrorDistance};
-			panel.size = {mirrorWidth, mirrorWidth * aspect};
 		}
 
 		layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&panel);
@@ -577,12 +585,16 @@ void CVRManager::Init()
 	}
 
 	impl->stereo = configHandler->GetBool("VRStereo");
+	impl->tableView = (configHandler->GetString("VRView") != "camera");
+	impl->tableSize = configHandler->GetFloat("VRTableSize");
+	impl->tableDistance = configHandler->GetFloat("VRTableDistance");
+	impl->tableHeight = configHandler->GetFloat("VRTableHeight");
 	impl->worldScale = configHandler->GetFloat("VRWorldScale");
 	impl->mirrorDistance = configHandler->GetFloat("VRMirrorDistance");
 	impl->mirrorWidth = configHandler->GetFloat("VRMirrorWidth");
 
 	if (impl->CreateInstance() && impl->CreateSession() && impl->CreateSwapchains()) {
-		LOG("[VR] OpenXR session created (stereo=%d, worldScale=%.0f); waiting for the runtime to start it", impl->stereo, impl->worldScale);
+		LOG("[VR] OpenXR session created (stereo=%d, view=%s); waiting for the runtime to start it", impl->stereo, impl->tableView ? "table" : "camera");
 		return;
 	}
 
@@ -626,7 +638,7 @@ void CVRManager::BeginFrame()
 }
 
 
-void CVRManager::DrawEyes(const std::function<void()>& drawWorld)
+void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const std::function<void()>& drawWorld)
 {
 	if (!impl->frameBegun || !impl->frameState.shouldRender || !impl->viewsValid)
 		return;
@@ -636,22 +648,49 @@ void CVRManager::DrawEyes(const std::function<void()>& drawWorld)
 	const float3 savedPos = cam->GetPos();
 	const float savedFov = cam->GetVFOV();
 
-	// anchor the VR space at the player camera, keeping only its heading so the
-	// horizon stays level: XR +x -> anchorRight, +y -> world up, -z -> anchorFwd
-	float3 anchorFwd = cam->GetForward();
-	anchorFwd.y = 0.0f;
-	if (anchorFwd.SqLength() < 1e-4f) {
-		// looking straight down; use the camera's up vector as the heading
-		anchorFwd = cam->GetUp();
-		anchorFwd.y = 0.0f;
+	// Map OpenXR LOCAL space (metres; +x right, +y up, -z forward) to world
+	// space (elmos): world = origin + axes(xr - xrOrigin) * scale
+	float3 origin;
+	float3 xrOrigin;
+	float3 axisX; // world direction of XR +x
+	float3 axisZ; // world direction of XR +z (towards the player)
+	float scale = 1.0f;
+
+	if (impl->tableView) {
+		// the whole map as a miniature on a table in front of the player:
+		// map north points away from the player, sea level is the table top
+		const float mapSizeX = static_cast<float>(mapDims.mapx * SQUARE_SIZE);
+		const float mapSizeZ = static_cast<float>(mapDims.mapy * SQUARE_SIZE);
+
+		scale = std::max(mapSizeX, mapSizeZ) / impl->tableSize;
+		origin = float3(mapSizeX * 0.5f, 0.0f, mapSizeZ * 0.5f);
+		xrOrigin = float3(0.0f, impl->tableHeight, -impl->tableDistance);
+		axisX = float3(1.0f, 0.0f, 0.0f);
+		axisZ = float3(0.0f, 0.0f, 1.0f);
+	} else {
+		// anchored at the player camera, keeping only its heading so the
+		// horizon stays level
+		float3 heading = cam->GetForward();
+		heading.y = 0.0f;
+		if (heading.SqLength() < 1e-4f) {
+			// looking straight down; use the camera's up vector as the heading
+			heading = cam->GetUp();
+			heading.y = 0.0f;
+		}
+		heading.Normalize();
+
+		scale = impl->worldScale;
+		origin = savedPos;
+		xrOrigin = float3(0.0f, 0.0f, 0.0f);
+		axisX = heading.cross(UpVector).Normalize();
+		axisZ = -heading;
 	}
-	anchorFwd.Normalize();
 
-	const float3 anchorUp = UpVector;
-	const float3 anchorRight = anchorFwd.cross(anchorUp).Normalize();
-
-	const auto ToWorld = [&](const XrVector3f& v) {
-		return (anchorRight * v.x) + (anchorUp * v.y) - (anchorFwd * v.z);
+	const auto ToWorldDir = [&](const XrVector3f& v) {
+		return (axisX * v.x) + (UpVector * v.y) + (axisZ * v.z);
+	};
+	const auto ToWorldPos = [&](const XrVector3f& p) {
+		return origin + ToWorldDir({p.x - xrOrigin.x, p.y - xrOrigin.y, p.z - xrOrigin.z}) * scale;
 	};
 
 	bool ok = true;
@@ -662,9 +701,9 @@ void CVRManager::DrawEyes(const std::function<void()>& drawWorld)
 
 		CCamera::VROverride& ovr = cam->vrOverride;
 		ovr.active  = true;
-		ovr.forward = ToWorld(Rotate(pose.orientation, {0.0f, 0.0f, -1.0f})).Normalize();
-		ovr.up      = ToWorld(Rotate(pose.orientation, {0.0f, 1.0f,  0.0f})).Normalize();
-		ovr.right   = ToWorld(Rotate(pose.orientation, {1.0f, 0.0f,  0.0f})).Normalize();
+		ovr.forward = ToWorldDir(Rotate(pose.orientation, {0.0f, 0.0f, -1.0f})).Normalize();
+		ovr.up      = ToWorldDir(Rotate(pose.orientation, {0.0f, 1.0f,  0.0f})).Normalize();
+		ovr.right   = ToWorldDir(Rotate(pose.orientation, {1.0f, 0.0f,  0.0f})).Normalize();
 		ovr.tanFov  = float4(std::tan(fov.angleLeft), std::tan(fov.angleRight), std::tan(fov.angleDown), std::tan(fov.angleUp));
 
 		// the culling frustum is symmetric and uses the desktop aspect ratio;
@@ -675,8 +714,12 @@ void CVRManager::DrawEyes(const std::function<void()>& drawWorld)
 		const float tanNeeded = std::max(tanVert, tanHorz / aspect);
 		cam->SetVFOV(2.0f * std::atan(tanNeeded) * (180.0f / 3.14159265f));
 
-		cam->SetPos(savedPos + ToWorld(pose.position) * impl->worldScale);
+		cam->SetPos(ToWorldPos(pose.position));
 		cam->Update();
+
+		// visibility (unit/feature draw flags, ground patches, shadow fit) is
+		// computed in the update step from the active camera; redo it per eye
+		updateForCamera();
 		UniformConstants::GetInstance().UpdateMatrices();
 
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -691,6 +734,9 @@ void CVRManager::DrawEyes(const std::function<void()>& drawWorld)
 	cam->SetPos(savedPos);
 	cam->SetVFOV(savedFov);
 	cam->Update();
+
+	// restore the desktop camera's visibility for the desktop draw
+	updateForCamera();
 	UniformConstants::GetInstance().UpdateMatrices();
 
 	impl->eyesDrawn = ok;

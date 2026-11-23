@@ -1508,10 +1508,20 @@ bool CGame::Draw() {
 
 		#ifdef ENABLE_OPENXR
 		// draw the world once per eye for the headset, before the desktop view
-		CVRManager::GetInstance().DrawEyes([this]() {
-			worldDrawer.Draw();
-			worldDrawer.ResetMVPMatrices();
-		});
+		// visibility is computed in the update step from the active camera, so
+		// it is redone per eye (and again for the desktop afterwards); the
+		// shadow fit is left alone because the shadow map is already rendered
+		CVRManager::GetInstance().DrawEyes(
+			[]() {
+				worldDrawer.Update(false);
+				transformsUploader.Update();
+				modelUniformsUploader.Update();
+			},
+			[]() {
+				worldDrawer.Draw();
+				worldDrawer.ResetMVPMatrices();
+			}
+		);
 		#endif
 
 		// restore back to the default FBO / Viewport

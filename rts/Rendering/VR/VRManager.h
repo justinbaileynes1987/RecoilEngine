@@ -34,12 +34,16 @@ public:
 
 	/**
 	 * Call from the game's draw, before the desktop world is drawn. Draws the
-	 * world once per eye from the player camera's position, offset by the
-	 * tracked head pose, and copies each result into that eye's swapchain.
+	 * world once per eye (as a miniature on a virtual table, or from the player
+	 * camera offset by the head pose, per VRView) and copies each result into
+	 * that eye's swapchain. Leaves the player camera as it found it.
+	 * @param updateForCamera redoes the camera-dependent update work (draw
+	 *        flags, ground patches, model uploads) for the active camera; also
+	 *        called once more after the eyes to restore the desktop state
 	 * @param drawWorld draws the world into the default framebuffer using the
 	 *        active camera (normally CWorldDrawer::Draw + ResetMVPMatrices)
 	 */
-	void DrawEyes(const std::function<void()>& drawWorld);
+	void DrawEyes(const std::function<void()>& updateForCamera, const std::function<void()>& drawWorld);
 
 	/**
 	 * Call once per main-loop iteration, just before the desktop swap.
