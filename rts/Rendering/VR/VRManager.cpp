@@ -7,8 +7,6 @@
 #include <cstring>
 #include <vector>
 
-#include "Game/Camera.h"
-#include "Game/CameraHandler.h"
 #include "Rendering/GL/myGL.h"
 #include "Rendering/GlobalRendering.h"
 #include "Rendering/UniformConstants.h"
@@ -30,6 +28,11 @@
 #define XR_USE_GRAPHICS_API_OPENGL
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+
+// after the OpenXR headers: Camera.h defines a `camera` macro that would
+// clash with OpenXR struct members of the same name
+#include "Game/Camera.h"
+#include "Game/CameraHandler.h"
 
 CONFIG(bool, VREnable).defaultValue(false).description("Zero-K VR: start an OpenXR session and show the game in a connected headset.");
 CONFIG(bool, VRStereo).defaultValue(true).description("Zero-K VR: draw the battlefield in stereo around the player camera. When off, only the floating desktop panel is shown.");
