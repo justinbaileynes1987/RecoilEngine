@@ -25,6 +25,8 @@ namespace {
 	 *   contexts directly. Default "desktop": cut from the desktop frame.
 	 *   "bar" panels stand on the table's far edge, left to right in list order;
 	 *   "palette" panels float over the off hand, bottom to top in list order.
+	 *   "side" panels stand off to the pointer hand's side and lazily follow the
+	 *   head, bottom to top in list order.
 	 * @return boolean ok
 	 */
 	int SetVRPanels(lua_State* L)
@@ -50,6 +52,8 @@ namespace {
 				lua_getfield(L, -1, "anchor");
 				if (lua_isstring(L, -1) && strcmp(lua_tostring(L, -1), "palette") == 0)
 					p.anchor = VRState::UI_ANCHOR_PALETTE;
+				else if (lua_isstring(L, -1) && strcmp(lua_tostring(L, -1), "side") == 0)
+					p.anchor = VRState::UI_ANCHOR_SIDE;
 				lua_pop(L, 1);
 
 				lua_getfield(L, -1, "width");

@@ -65,10 +65,13 @@ CONFIG(bool, VRPanel).defaultValue(true).description("Zero-K VR: show the deskto
 CONFIG(bool, VRPointer).defaultValue(true).description("Zero-K VR (table view): use the controller pointer as the mouse (pointer hand: trigger = left click, A/X = right click; other hand: trigger holds Shift). The desktop camera is held over the whole map while VR runs, so every point the pointer reaches is on screen.");
 CONFIG(float, VRPointerMargin).defaultValue(1.6f).minimumValue(1.0f).description("Zero-K VR (table view, pointer on): how much room the desktop view leaves around the map, as a multiple of the map size, so pointer clicks stay clear of the UI at the screen edges.");
 CONFIG(float, VRMirrorWidth).defaultValue(1.77f).minimumValue(0.1f).description("Zero-K VR: width in metres of the desktop panel (UI). The default, 1.77, is an 80-inch 16:9 TV.");
-CONFIG(bool, VRUIPanels).defaultValue(true).description("Zero-K VR (table view): show the UI panels LuaUI asks for (Spring.SetVRPanels): a bar on the table's far edge and a palette on the off hand. While there are any, the big desktop panel is hidden until the pointer hand's thumbstick click shows it.");
-CONFIG(float, VRBarScale).defaultValue(0.0007f).minimumValue(0.0001f).description("Zero-K VR: size of the far-edge UI bar, in metres per window pixel.");
-CONFIG(float, VRBarMaxDistance).defaultValue(1.6f).minimumValue(0.3f).description("Zero-K VR: the far-edge UI bar comes no farther than this many metres (horizontally) from your head, however big the table is zoomed.");
+CONFIG(bool, VRUIPanels).defaultValue(true).description("Zero-K VR (table view): show the UI panels LuaUI asks for (Spring.SetVRPanels): a bar on the table edge facing you, panels at your side that follow you, and a palette on the off hand. While there are any, the big desktop panel is hidden until the pointer hand's thumbstick click shows it.");
+CONFIG(float, VRBarScale).defaultValue(0.0007f).minimumValue(0.0001f).description("Zero-K VR: size of the table-edge UI bar, in metres per window pixel (when LuaUI gives no width).");
+CONFIG(float, VRBarMaxDistance).defaultValue(1.6f).minimumValue(0.3f).description("Zero-K VR: the table-edge UI bar comes no farther than this many metres (horizontally) from your head, however big the table is zoomed.");
 CONFIG(float, VRPaletteScale).defaultValue(0.0005f).minimumValue(0.0001f).description("Zero-K VR: size of the off-hand UI palette, in metres per window pixel.");
+CONFIG(float, VRSideAngle).defaultValue(40.0f).description("Zero-K VR: how far round to the pointer hand's side the side UI panel (orders, build menu) sits, in degrees from where you face.");
+CONFIG(float, VRSideDistance).defaultValue(0.6f).minimumValue(0.2f).description("Zero-K VR: distance in metres from your head to the side UI panel.");
+CONFIG(float, VRSideHeight).defaultValue(-0.35f).description("Zero-K VR: height in metres of the side UI panel's centre relative to your eyes.");
 CONFIG(float, VRPaletteTilt).defaultValue(30.0f).description("Zero-K VR: how far the off-hand palette leans back from the controller's grip, in degrees, so its face points up towards your eyes.");
 
 
@@ -307,6 +310,17 @@ struct CVRManager::Impl
 	bool paletteShown = false;    // the off-hand palette faces the head (with hysteresis)
 	// VR UI (RmlUi) pointer state: buttons held on the UI, hovering it, or a
 	// button held in the world (a drag), so a press keeps its target until release
+	// the bar's heading (turns to the player as they walk around the table)
+	// and the side panel's lazily followed head yaw and position
+	float barYaw = 0.0f;
+	bool barYawValid = false;
+	float sideYaw = 0.0f;
+	float3 sidePos;
+	bool sideValid = false;
+	float sideScale = 0.0005f;
+	float sideAngle = 0.7f;    // radians
+	float sideDistance = 0.6f;
+	float sideHeight = -0.35f;
 	bool uiButtons[2] = {false, false};
 	bool uiHover = false;
 	bool worldHeld = false;
@@ -1039,7 +1053,7 @@ void CVRManager::Impl::SyncUIPanels()
 		layer.h = y1 - y0;
 		layer.metresPerPixel = (req.widthM > 0.0f) ? req.widthM / static_cast<float>(layer.w) : 0.0f;
 
-		summary += " " + layer.name + ((layer.anchor == VRState::UI_ANCHOR_PALETTE) ? "(palette " : "(bar ") + std::to_string(layer.w) + "x" + std::to_string(layer.h) + ")";
+		summary += " " + layer.name + ((layer.anchor == VRState::UI_ANCHOR_PALETTE) ? "(palette " : (layer.anchor == VRState::UI_ANCHOR_SIDE) ? "(side " : "(bar ") + std::to_string(layer.w) + "x" + std::to_string(layer.h) + ")";
 		next.push_back(std::move(layer));
 	}
 
@@ -1101,10 +1115,29 @@ void CVRManager::Impl::LayoutUIPanels()
 
 			const float mapX = static_cast<float>(mapDims.mapx * SQUARE_SIZE);
 			const float mapZ = static_cast<float>(mapDims.mapy * SQUARE_SIZE);
-			const float halfDepth = table.size * mapZ / std::max(std::max(mapX, mapZ), 1.0f) * 0.5f;
+			const float mapMax = std::max(std::max(mapX, mapZ), 1.0f);
+			const float halfX = table.size * mapX / mapMax * 0.5f;
+			const float halfZ = table.size * mapZ / mapMax * 0.5f;
 
-			const float3 away = RotY(float3(0.0f, 0.0f, -1.0f), table.yaw);
-			float3 base = table.center + away * (halfDepth + 0.05f);
+			// the bar stands on the table edge opposite the player, wherever they
+			// walk: its heading turns smoothly towards the head
+			float3 toHead = head - table.center;
+			toHead.y = 0.0f;
+			const float targetYaw = (toHead.SqLength() > 1e-4f) ? std::atan2(toHead.x, toHead.z) : table.yaw;
+			if (!barYawValid) {
+				barYaw = targetYaw;
+				barYawValid = true;
+			}
+			barYaw = WrapAngle(barYaw + WrapAngle(targetYaw - barYaw) * 0.08f);
+
+			// "away" from the head, in the table's own frame, to its edge
+			const float3 away = RotY(float3(0.0f, 0.0f, -1.0f), barYaw);
+			const float3 awayLocal = RotY(away, -table.yaw);
+			const float edgeT = std::min(
+				(std::abs(awayLocal.x) > 1e-4f) ? halfX / std::abs(awayLocal.x) : 1e9f,
+				(std::abs(awayLocal.z) > 1e-4f) ? halfZ / std::abs(awayLocal.z) : 1e9f
+			);
+			float3 base = table.center + away * (edgeT + 0.05f);
 			base.y = table.center.y + 0.02f;
 
 			float3 toBase = base - head;
@@ -1115,8 +1148,8 @@ void CVRManager::Impl::LayoutUIPanels()
 				base = float3(pulled.x, base.y, pulled.z);
 			}
 
-			// face the player at the table's heading, top leaning away
-			const XrQuaternionf q = QuatMul(QuatAxisAngle(UpVector, table.yaw), QuatAxisAngle(float3(1.0f, 0.0f, 0.0f), -LEAN));
+			// face the player, top leaning away
+			const XrQuaternionf q = QuatMul(QuatAxisAngle(UpVector, barYaw), QuatAxisAngle(float3(1.0f, 0.0f, 0.0f), -LEAN));
 			const float3 right = ToF3(Rotate(q, {1.0f, 0.0f, 0.0f}));
 			const float3 up = ToF3(Rotate(q, {0.0f, 1.0f, 0.0f}));
 
@@ -1135,6 +1168,72 @@ void CVRManager::Impl::LayoutUIPanels()
 				layer.quad.height = h;
 				layer.visible = true;
 				x += w + GAP;
+			}
+		}
+	}
+
+	// the side panel: off to the pointer hand's side at about waist height,
+	// facing the head. It follows lazily: it stays where it is while the head
+	// turns less than SIDE_DEADZONE away from it, then glides along, so it is
+	// always a short glance away but never swims with every head movement.
+	{
+		float totalH = 0.0f;
+		for (const UIPanelLayer& layer: uiLayers) {
+			if (layer.anchor == VRState::UI_ANCHOR_SIDE)
+				totalH += layer.h * Scale(layer, sideScale);
+		}
+
+		if (totalH > 0.0f && viewsValid) {
+			constexpr float SIDE_DEADZONE = 35.0f * 0.0174533f;
+			constexpr float GAP = 0.015f;
+			constexpr float LEAN = 20.0f * 0.0174533f;
+
+			float3 fwd = ToF3(Rotate(views[0].pose.orientation, {0.0f, 0.0f, -1.0f}));
+			fwd.y = 0.0f;
+			const float headYaw = (fwd.SqLength() > 1e-4f) ? YawOf(fwd) : sideYaw;
+
+			if (!sideValid) {
+				sideYaw = headYaw;
+				sidePos = head;
+				sideValid = true;
+			}
+
+			// the yaw the panel is anchored to: pulled along only by the part of
+			// the head turn beyond the dead zone, eased
+			const float diff = WrapAngle(headYaw - sideYaw);
+			if (std::abs(diff) > SIDE_DEADZONE) {
+				const float excess = diff - std::copysign(SIDE_DEADZONE, diff);
+				sideYaw = WrapAngle(sideYaw + excess * 0.15f);
+			}
+			sidePos = sidePos + (head - sidePos) * 0.1f;
+
+			// pointer hand right (1): the panel goes to the right (clockwise, negative yaw)
+			const float sideSign = (pointerHand == 1) ? -1.0f : 1.0f;
+			const float panelYaw = sideYaw + sideSign * sideAngle;
+			const float3 dir = RotY(float3(0.0f, 0.0f, -1.0f), panelYaw);
+			float3 base = sidePos + dir * sideDistance;
+			base.y = sidePos.y + sideHeight;
+
+			// faces the head: its +z points back along dir
+			const XrQuaternionf q = QuatMul(QuatAxisAngle(UpVector, panelYaw), QuatAxisAngle(float3(1.0f, 0.0f, 0.0f), -LEAN));
+			const float3 up = ToF3(Rotate(q, {0.0f, 1.0f, 0.0f}));
+
+			// stacked bottom to top, centred on the anchor height
+			float y = -totalH * 0.5f;
+			for (UIPanelLayer& layer: uiLayers) {
+				if (layer.anchor != VRState::UI_ANCHOR_SIDE)
+					continue;
+
+				const float w = layer.w * Scale(layer, sideScale);
+				const float h = layer.h * Scale(layer, sideScale);
+				const float3 c = base + up * (y + h * 0.5f);
+
+				layer.quad.pose.orientation = q;
+				layer.quad.pose.position = ToXr(c);
+				layer.quad.width = w;
+				layer.quad.height = h;
+				layer.visible = true;
+				y += h + GAP;
 			}
 		}
 	}
@@ -1513,6 +1612,9 @@ void CVRManager::Init()
 	impl->barMaxDistance = configHandler->GetFloat("VRBarMaxDistance");
 	impl->paletteScale = configHandler->GetFloat("VRPaletteScale");
 	impl->paletteTilt = configHandler->GetFloat("VRPaletteTilt") * 0.0174533f;
+	impl->sideAngle = configHandler->GetFloat("VRSideAngle") * 0.0174533f;
+	impl->sideDistance = configHandler->GetFloat("VRSideDistance");
+	impl->sideHeight = configHandler->GetFloat("VRSideHeight");
 
 	if (impl->CreateInstance() && impl->CreateSession() && impl->CreateSwapchains()) {
 		LOG("[VR] OpenXR session created (stereo=%d, view=%s); waiting for the runtime to start it", impl->stereo, impl->tableView ? "table" : "camera");
