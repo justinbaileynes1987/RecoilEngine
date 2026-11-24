@@ -93,6 +93,10 @@
 #include "System/SpringHash.h"
 #include "System/LoadLock.h"
 
+#ifdef ENABLE_OPENXR
+#include "Rendering/VR/VRLua.h"
+#endif
+
 
 #if !defined(HEADLESS) && !defined(NO_SOUND)
 #include "System/Sound/OpenAL/EFX.h"
@@ -347,6 +351,10 @@ bool LuaUnsyncedCtrl::PushEntries(lua_State* L)
 	REGISTER_LUA_CFUNC(RequestStartPosition);
 
 	REGISTER_LUA_CFUNC(Yield);
+
+#ifdef ENABLE_OPENXR
+	VRLua::PushEntries(L); // Zero-K VR: Spring.SetVRPanels
+#endif
 
 	return true;
 }

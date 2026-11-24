@@ -3,6 +3,8 @@
 #pragma once
 
 #include <algorithm>
+#include <string>
+#include <vector>
 
 #include "System/float3.h"
 
@@ -67,4 +69,20 @@ namespace VRState {
 	inline float IconSwitchDistance(const float3& pos) {
 		return std::max(eyePos[0].distance(pos), eyePos[1].distance(pos));
 	}
+
+	// Floating UI panels: rectangles of the desktop window (top-left origin,
+	// window pixels) that LuaUI asks to show as panels of their own in the
+	// headset (Spring.SetVRPanels, see VRLua.cpp). The pointer clicks them
+	// like the desktop panel. Every change bumps uiPanelsVersion.
+	enum UIPanelAnchor { UI_ANCHOR_BAR = 0, UI_ANCHOR_PALETTE = 1 };
+	struct UIPanelRequest {
+		std::string name;
+		int anchor = UI_ANCHOR_BAR; // bar: on the table's far edge; palette: on the off hand
+		int x = 0;
+		int y = 0;
+		int w = 0;
+		int h = 0;
+	};
+	inline std::vector<UIPanelRequest> uiPanels;
+	inline int uiPanelsVersion = 0;
 }

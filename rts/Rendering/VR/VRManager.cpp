@@ -64,6 +64,11 @@ CONFIG(bool, VRPanel).defaultValue(true).description("Zero-K VR: show the deskto
 CONFIG(bool, VRPointer).defaultValue(true).description("Zero-K VR (table view): use the controller pointer as the mouse (pointer hand: trigger = left click, A/X = right click; other hand: trigger holds Shift). The desktop camera is held over the whole map while VR runs, so every point the pointer reaches is on screen.");
 CONFIG(float, VRPointerMargin).defaultValue(1.6f).minimumValue(1.0f).description("Zero-K VR (table view, pointer on): how much room the desktop view leaves around the map, as a multiple of the map size, so pointer clicks stay clear of the UI at the screen edges.");
 CONFIG(float, VRMirrorWidth).defaultValue(1.77f).minimumValue(0.1f).description("Zero-K VR: width in metres of the desktop panel (UI). The default, 1.77, is an 80-inch 16:9 TV.");
+CONFIG(bool, VRUIPanels).defaultValue(true).description("Zero-K VR (table view): show the UI panels LuaUI asks for (Spring.SetVRPanels): a bar on the table's far edge and a palette on the off hand. While there are any, the big desktop panel is hidden until the pointer hand's thumbstick click shows it.");
+CONFIG(float, VRBarScale).defaultValue(0.0007f).minimumValue(0.0001f).description("Zero-K VR: size of the far-edge UI bar, in metres per window pixel.");
+CONFIG(float, VRBarMaxDistance).defaultValue(1.6f).minimumValue(0.3f).description("Zero-K VR: the far-edge UI bar comes no farther than this many metres (horizontally) from your head, however big the table is zoomed.");
+CONFIG(float, VRPaletteScale).defaultValue(0.0005f).minimumValue(0.0001f).description("Zero-K VR: size of the off-hand UI palette, in metres per window pixel.");
+CONFIG(float, VRPaletteTilt).defaultValue(30.0f).description("Zero-K VR: how far the off-hand palette leans back from the controller's grip, in degrees, so its face points up towards your eyes.");
 
 
 namespace {
@@ -88,6 +93,51 @@ namespace {
 	}
 
 	float3 ToF3(const XrVector3f& v) { return {v.x, v.y, v.z}; }
+	XrVector3f ToXr(const float3& v) { return {v.x, v.y, v.z}; }
+
+	XrQuaternionf QuatMul(const XrQuaternionf& a, const XrQuaternionf& b)
+	{
+		return {
+			a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+			a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+			a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+			a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+		};
+	}
+
+	// rotation by angle a (radians, right-handed) about a unit axis
+	XrQuaternionf QuatAxisAngle(const float3& axis, float a)
+	{
+		const float s = std::sin(a * 0.5f);
+		return {axis.x * s, axis.y * s, axis.z * s, std::cos(a * 0.5f)};
+	}
+
+	// a flat rectangle facing its local +z (an OpenXR quad layer), metres
+	struct PanelQuad {
+		XrPosef pose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+		float width = 0.0f;
+		float height = 0.0f;
+	};
+
+	// where a ray (LOCAL space) meets the front of a quad: distance t along the
+	// ray and (u, v) in 0..1 from the quad's bottom-left; false if it misses
+	bool RayQuad(const PanelQuad& q, const float3& from, const float3& dir, float& t, float& u, float& v)
+	{
+		const float3 n = ToF3(Rotate(q.pose.orientation, {0.0f, 0.0f, 1.0f}));
+		const float denom = dir.dot(n);
+		if (denom > -1e-4f)
+			return false; // parallel, or seen from behind
+
+		const float3 c = ToF3(q.pose.position);
+		t = (c - from).dot(n) / denom;
+		if (t <= 0.0f)
+			return false;
+
+		const float3 d = from + dir * t - c;
+		u = d.dot(ToF3(Rotate(q.pose.orientation, {1.0f, 0.0f, 0.0f}))) / q.width + 0.5f;
+		v = d.dot(ToF3(Rotate(q.pose.orientation, {0.0f, 1.0f, 0.0f}))) / q.height + 0.5f;
+		return (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f);
+	}
 
 	// rotate v by angle a (radians) about the vertical axis; positive is
 	// counter-clockwise seen from above (OpenXR: +x right, +y up, -z forward)
@@ -151,6 +201,10 @@ namespace {
 	}
 
 	constexpr float POINTER_LENGTH = 5.0f; // metres
+
+	// UI panel quad layers per frame; with the eye layer and the desktop panel
+	// this stays under the 16 layers every OpenXR runtime must support
+	constexpr int MAX_UI_LAYERS = 8;
 
 	constexpr float MIN_TABLE_SIZE = 0.2f;   // metres
 	constexpr float MAX_TABLE_SIZE = 200.0f; // metres; large enough to stand inside a base
@@ -233,6 +287,35 @@ struct CVRManager::Impl
 	// where the desktop panel floats (LOCAL space): its centre and size in metres
 	void PanelRect(bool behindTable, float3& center, float& width, float& height) const;
 
+	// UI panels asked for by LuaUI (VRState::uiPanels): each shows a rectangle
+	// of the desktop window on its own quad layer, from its own swapchain
+	struct UIPanelLayer {
+		std::string name;
+		int anchor = VRState::UI_ANCHOR_BAR;
+		int x = 0, y = 0, w = 0, h = 0; // window pixels, top-left origin
+		ColorSwapchain sc;
+		bool visible = false;           // this frame
+		PanelQuad quad;
+	};
+	std::vector<UIPanelLayer> uiLayers;
+	int uiPanelsVersionSeen = -1;
+	bool uiPanelsEnabled = true;  // VRUIPanels
+	bool tvShown = false;         // the big desktop panel, while UI panels exist (thumbstick toggle)
+	bool paletteShown = false;    // the off-hand palette faces the head (with hysteresis)
+	float barScale = 0.0007f;
+	float barMaxDistance = 1.6f;
+	float paletteScale = 0.0005f;
+	float paletteTilt = 0.52f;    // radians
+	void SyncUIPanels();
+	void LayoutUIPanels();
+	void HideUIPanels();
+	// whether the big desktop panel shows: always outside the eye views (menus),
+	// in-game when VRPanel is on and either no UI panels exist or it is toggled on
+	bool TVVisible(bool inGameView) const {
+		return !inGameView || (showPanel && (!HaveUIPanels() || tvShown));
+	}
+	bool HaveUIPanels() const { return uiPanelsEnabled && tableView && !uiLayers.empty(); }
+
 	bool Check(XrResult result, const char* what) const;
 
 	bool CreateInstance();
@@ -244,7 +327,13 @@ struct CVRManager::Impl
 
 	void PollEvents();
 	void LocateViews();
-	bool CopyBackBufferTo(ColorSwapchain& sc, int srcX, int srcY, int srcSizeX, int srcSizeY);
+	// resolve a rectangle of the back buffer into resolveTex (at 0,0), then
+	// scale a rectangle of resolveTex into a swapchain's next image
+	bool ResolveBackBuffer(int srcX, int srcY, int srcSizeX, int srcSizeY);
+	bool BlitResolvedTo(ColorSwapchain& sc, int srcX, int srcY, int srcSizeX, int srcSizeY);
+	bool CopyBackBufferTo(ColorSwapchain& sc, int srcX, int srcY, int srcSizeX, int srcSizeY) {
+		return ResolveBackBuffer(srcX, srcY, srcSizeX, srcSizeY) && BlitResolvedTo(sc, 0, 0, srcSizeX, srcSizeY);
+	}
 	void SubmitFrame(bool haveFrame);
 };
 
@@ -505,6 +594,12 @@ void CVRManager::Impl::Destroy()
 
 		*sc = ColorSwapchain();
 	}
+	for (UIPanelLayer& layer: uiLayers) {
+		if (layer.sc.handle != XR_NULL_HANDLE)
+			xrDestroySwapchain(layer.sc.handle);
+	}
+	uiLayers.clear();
+	uiPanelsVersionSeen = -1;
 
 	input.Destroy();
 	inputReady = false;
@@ -608,32 +703,44 @@ void CVRManager::Impl::LocateViews()
 }
 
 
-bool CVRManager::Impl::CopyBackBufferTo(ColorSwapchain& sc, int srcX, int srcY, int srcSizeX, int srcSizeY)
+namespace {
+	// saves and restores the GL state a framebuffer blit touches
+	struct BlitStateGuard {
+		GLint prevReadFBO = 0;
+		GLint prevDrawFBO = 0;
+		GLboolean prevScissor = GL_FALSE;
+		GLboolean prevSRGB = GL_FALSE;
+
+		BlitStateGuard() {
+			glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFBO);
+			glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDrawFBO);
+			prevScissor = glIsEnabled(GL_SCISSOR_TEST);
+			prevSRGB = glIsEnabled(GL_FRAMEBUFFER_SRGB);
+			glDisable(GL_SCISSOR_TEST);
+			glDisable(GL_FRAMEBUFFER_SRGB);
+		}
+		~BlitStateGuard() {
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFBO);
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDrawFBO);
+			if (prevScissor)
+				glEnable(GL_SCISSOR_TEST);
+			if (prevSRGB)
+				glEnable(GL_FRAMEBUFFER_SRGB);
+		}
+	};
+}
+
+bool CVRManager::Impl::ResolveBackBuffer(int srcX, int srcY, int srcSizeX, int srcSizeY)
 {
-	uint32_t imageIndex = 0;
-	XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-	if (!Check(xrAcquireSwapchainImage(sc.handle, &acquireInfo, &imageIndex), "xrAcquireSwapchainImage"))
+	if (srcSizeX <= 0 || srcSizeY <= 0)
 		return false;
 
-	XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-	waitInfo.timeout = XR_INFINITE_DURATION;
-	if (!Check(xrWaitSwapchainImage(sc.handle, &waitInfo), "xrWaitSwapchainImage"))
-		return false;
-
-	GLint prevReadFBO = 0;
-	GLint prevDrawFBO = 0;
-	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFBO);
-	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDrawFBO);
-
-	const GLboolean prevScissor = glIsEnabled(GL_SCISSOR_TEST);
-	const GLboolean prevSRGB = glIsEnabled(GL_FRAMEBUFFER_SRGB);
-	glDisable(GL_SCISSOR_TEST);
-	glDisable(GL_FRAMEBUFFER_SRGB);
+	BlitStateGuard guard;
 
 	// drop errors raised before this point so the check below is about the copy
 	while (glGetError() != GL_NO_ERROR) {}
 
-	// 1. resolve (same size, so legal for a multisampled back buffer)
+	// resolve (same size, so legal for a multisampled back buffer)
 	if (resolveSizeX != srcSizeX || resolveSizeY != srcSizeY) {
 		if (resolveTex == 0)
 			glGenTextures(1, &resolveTex);
@@ -663,30 +770,54 @@ bool CVRManager::Impl::CopyBackBufferTo(ColorSwapchain& sc, int srcX, int srcY, 
 		GL_COLOR_BUFFER_BIT, GL_NEAREST
 	);
 
-	// 2. scale into the swapchain image
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, resolveFBO);
-	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, blitFBO);
-	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sc.images[imageIndex].image, 0);
-	glBlitFramebuffer(
-		0, 0, srcSizeX, srcSizeY,
-		0, 0, sc.sizeX, sc.sizeY,
-		GL_COLOR_BUFFER_BIT, GL_LINEAR
-	);
-
 	const GLenum glErr = glGetError();
 	if (glErr != GL_NO_ERROR && !loggedBlitError) {
-		LOG_L(L_ERROR, "[VR] copy into a swapchain image failed: GL error 0x%x (source %dx%d, target %dx%d)", glErr, srcSizeX, srcSizeY, sc.sizeX, sc.sizeY);
+		LOG_L(L_ERROR, "[VR] resolving the back buffer failed: GL error 0x%x (%dx%d)", glErr, srcSizeX, srcSizeY);
 		loggedBlitError = true;
 	}
 
-	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFBO);
-	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDrawFBO);
+	return true;
+}
 
-	if (prevScissor)
-		glEnable(GL_SCISSOR_TEST);
-	if (prevSRGB)
-		glEnable(GL_FRAMEBUFFER_SRGB);
+
+bool CVRManager::Impl::BlitResolvedTo(ColorSwapchain& sc, int srcX, int srcY, int srcSizeX, int srcSizeY)
+{
+	if (sc.handle == XR_NULL_HANDLE || resolveFBO == 0)
+		return false;
+
+	uint32_t imageIndex = 0;
+	XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+	if (!Check(xrAcquireSwapchainImage(sc.handle, &acquireInfo, &imageIndex), "xrAcquireSwapchainImage"))
+		return false;
+
+	XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+	waitInfo.timeout = XR_INFINITE_DURATION;
+	if (!Check(xrWaitSwapchainImage(sc.handle, &waitInfo), "xrWaitSwapchainImage"))
+		return false;
+
+	{
+		BlitStateGuard guard;
+
+		// drop errors raised before this point so the check below is about the copy
+		while (glGetError() != GL_NO_ERROR) {}
+
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, resolveFBO);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, blitFBO);
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sc.images[imageIndex].image, 0);
+		glBlitFramebuffer(
+			srcX, srcY, srcX + srcSizeX, srcY + srcSizeY,
+			0, 0, sc.sizeX, sc.sizeY,
+			GL_COLOR_BUFFER_BIT, GL_LINEAR
+		);
+
+		const GLenum glErr = glGetError();
+		if (glErr != GL_NO_ERROR && !loggedBlitError) {
+			LOG_L(L_ERROR, "[VR] copy into a swapchain image failed: GL error 0x%x (source %dx%d, target %dx%d)", glErr, srcSizeX, srcSizeY, sc.sizeX, sc.sizeY);
+			loggedBlitError = true;
+		}
+
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+	}
 
 	XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 	return Check(xrReleaseSwapchainImage(sc.handle, &releaseInfo), "xrReleaseSwapchainImage");
@@ -792,6 +923,199 @@ void CVRManager::Impl::PanelRect(bool behindTable, float3& center, float& width,
 }
 
 
+// picks up a changed set of UI panels from LuaUI; a panel keeps its swapchain
+// (by name) until its pixel size changes, which SubmitFrame handles
+void CVRManager::Impl::SyncUIPanels()
+{
+	if (uiPanelsVersionSeen == VRState::uiPanelsVersion)
+		return;
+
+	uiPanelsVersionSeen = VRState::uiPanelsVersion;
+
+	const int winX = globalRendering->winSizeX;
+	const int winY = globalRendering->winSizeY;
+
+	std::vector<UIPanelLayer> next;
+	std::string summary;
+
+	for (const VRState::UIPanelRequest& req: VRState::uiPanels) {
+		// clamp to the window
+		const int x0 = std::clamp(req.x, 0, winX);
+		const int y0 = std::clamp(req.y, 0, winY);
+		const int x1 = std::clamp(req.x + req.w, 0, winX);
+		const int y1 = std::clamp(req.y + req.h, 0, winY);
+		if (x1 - x0 < 4 || y1 - y0 < 4)
+			continue;
+
+		UIPanelLayer layer;
+		const auto old = std::find_if(uiLayers.begin(), uiLayers.end(), [&](const UIPanelLayer& l) { return l.name == req.name && l.sc.handle != XR_NULL_HANDLE; });
+		if (old != uiLayers.end()) {
+			layer.sc = old->sc;
+			old->sc = ColorSwapchain(); // moved
+		}
+
+		layer.name = req.name;
+		layer.anchor = req.anchor;
+		layer.x = x0;
+		layer.y = y0;
+		layer.w = x1 - x0;
+		layer.h = y1 - y0;
+
+		summary += " " + layer.name + ((layer.anchor == VRState::UI_ANCHOR_PALETTE) ? "(palette " : "(bar ") + std::to_string(layer.w) + "x" + std::to_string(layer.h) + ")";
+		next.push_back(std::move(layer));
+	}
+
+	for (UIPanelLayer& layer: uiLayers) {
+		if (layer.sc.handle != XR_NULL_HANDLE)
+			xrDestroySwapchain(layer.sc.handle);
+	}
+
+	uiLayers = std::move(next);
+	LOG_L(L_DEBUG, "[VR] UI panels:%s", summary.empty() ? " none" : summary.c_str());
+
+	static bool loggedFirst = false;
+	if (!loggedFirst && !uiLayers.empty()) {
+		LOG("[VR] UI panels from LuaUI:%s (pointer-hand thumbstick click shows the big desktop panel)", summary.c_str());
+		loggedFirst = true;
+	}
+}
+
+
+void CVRManager::Impl::HideUIPanels()
+{
+	for (UIPanelLayer& layer: uiLayers) {
+		layer.visible = false;
+	}
+}
+
+
+// places the UI panels for this frame (LOCAL space):
+//  - bar: standing on the table's far edge, facing the player, leaning back a
+//    little, left to right in list order; never farther than VRBarMaxDistance
+//  - palette: over the off hand's controller, bottom to top in list order,
+//    shown while it faces the head (glance at it like a tablet)
+void CVRManager::Impl::LayoutUIPanels()
+{
+	HideUIPanels();
+
+	if (!HaveUIPanels())
+		return;
+
+	float3 head;
+	if (viewsValid)
+		head = (ToF3(views[0].pose.position) + ToF3(views[1].pose.position)) * 0.5f;
+
+	// the bar
+	{
+		float totalW = 0.0f;
+		int count = 0;
+		for (const UIPanelLayer& layer: uiLayers) {
+			if (layer.anchor != VRState::UI_ANCHOR_BAR)
+				continue;
+			totalW += layer.w * barScale;
+			count++;
+		}
+
+		if (count > 0) {
+			constexpr float GAP = 0.02f;
+			constexpr float LEAN = 15.0f * 0.0174533f;
+			totalW += GAP * (count - 1);
+
+			const float mapX = static_cast<float>(mapDims.mapx * SQUARE_SIZE);
+			const float mapZ = static_cast<float>(mapDims.mapy * SQUARE_SIZE);
+			const float halfDepth = table.size * mapZ / std::max(std::max(mapX, mapZ), 1.0f) * 0.5f;
+
+			const float3 away = RotY(float3(0.0f, 0.0f, -1.0f), table.yaw);
+			float3 base = table.center + away * (halfDepth + 0.05f);
+			base.y = table.center.y + 0.02f;
+
+			float3 toBase = base - head;
+			toBase.y = 0.0f;
+			const float dist = toBase.Length();
+			if (dist > barMaxDistance) {
+				const float3 pulled = head + toBase * (barMaxDistance / dist);
+				base = float3(pulled.x, base.y, pulled.z);
+			}
+
+			// face the player at the table's heading, top leaning away
+			const XrQuaternionf q = QuatMul(QuatAxisAngle(UpVector, table.yaw), QuatAxisAngle(float3(1.0f, 0.0f, 0.0f), -LEAN));
+			const float3 right = ToF3(Rotate(q, {1.0f, 0.0f, 0.0f}));
+			const float3 up = ToF3(Rotate(q, {0.0f, 1.0f, 0.0f}));
+
+			float x = -totalW * 0.5f;
+			for (UIPanelLayer& layer: uiLayers) {
+				if (layer.anchor != VRState::UI_ANCHOR_BAR)
+					continue;
+
+				const float w = layer.w * barScale;
+				const float h = layer.h * barScale;
+				const float3 c = base + right * (x + w * 0.5f) + up * (h * 0.5f);
+
+				layer.quad.pose.orientation = q;
+				layer.quad.pose.position = ToXr(c);
+				layer.quad.width = w;
+				layer.quad.height = h;
+				layer.visible = true;
+				x += w + GAP;
+			}
+		}
+	}
+
+	// the palette, on the hand that is not pointing, unless it holds the table
+	{
+		const int paletteHand = 1 - pointerHand;
+		const VRHandState& hand = input.Hand(paletteHand);
+		const bool handFree = hand.gripValid && ((grabMask >> paletteHand) & 1) == 0;
+
+		float totalH = 0.0f;
+		for (const UIPanelLayer& layer: uiLayers) {
+			if (layer.anchor == VRState::UI_ANCHOR_PALETTE)
+				totalH += layer.h * paletteScale;
+		}
+
+		if (!handFree || totalH <= 0.0f) {
+			paletteShown = false;
+			return;
+		}
+
+		constexpr float GAP = 0.01f;
+		constexpr float LIFT = 0.05f; // metres from the grip to the palette's bottom edge
+
+		// the grip's +z points back along the controller (towards the player
+		// when pointing ahead) and +y up out of the hand: lean the face back
+		// so it points up towards the eyes
+		const XrQuaternionf q = QuatMul(hand.grip.orientation, QuatAxisAngle(float3(1.0f, 0.0f, 0.0f), -paletteTilt));
+		const float3 up = ToF3(Rotate(q, {0.0f, 1.0f, 0.0f}));
+		const float3 normal = ToF3(Rotate(q, {0.0f, 0.0f, 1.0f}));
+		const float3 grip = ToF3(hand.grip.position);
+
+		// shown while it faces the head; hysteresis so it doesn't flicker
+		const float3 toHead = (head - (grip + up * (LIFT + totalH * 0.5f))).SafeNormalize();
+		const float facing = toHead.dot(normal);
+		paletteShown = (facing > (paletteShown ? 0.15f : 0.35f));
+		if (!paletteShown)
+			return;
+
+		float y = LIFT;
+		for (UIPanelLayer& layer: uiLayers) {
+			if (layer.anchor != VRState::UI_ANCHOR_PALETTE)
+				continue;
+
+			const float w = layer.w * paletteScale;
+			const float h = layer.h * paletteScale;
+			const float3 c = grip + up * (y + h * 0.5f);
+
+			layer.quad.pose.orientation = q;
+			layer.quad.pose.position = ToXr(c);
+			layer.quad.width = w;
+			layer.quad.height = h;
+			layer.visible = true;
+			y += h + GAP;
+		}
+	}
+}
+
+
 void CVRManager::Impl::UpdatePointer()
 {
 	pointerHit = 0;
@@ -811,6 +1135,13 @@ void CVRManager::Impl::UpdatePointer()
 
 	// a thumbstick click or A/X on the other hand moves the pointer there, once
 	// the pointer hand holds no mouse button (A/X then also right-clicks, as before)
+	// a thumbstick click on the pointer hand shows or hides the big desktop
+	// panel (menus, chat, settings) while the UI panels are up
+	if (pressed[pointerHand][2] && HaveUIPanels()) {
+		tvShown = !tvShown;
+		LOG("[VR] desktop panel %s", tvShown ? "shown" : "hidden");
+	}
+
 	const int otherHand = 1 - pointerHand;
 	const bool pointerBusy = (triggerRole[pointerHand] == TRIGGER_CLICK) || commandClick[pointerHand];
 	if ((pressed[otherHand][1] || pressed[otherHand][2]) && !pointerBusy)
@@ -861,24 +1192,38 @@ void CVRManager::Impl::UpdatePointer()
 			VRState::eyePos[1] = m.Pos(views[1].pose.position);
 		}
 
-		// the panel faces the player (+z); a hit on it wins over the world
-		if (showPanel && dirXR.z < -1e-4f && globalRendering->winSizeX > 0 && globalRendering->winSizeY > 0) {
-			float3 center;
-			float width = 0.0f;
-			float height = 0.0f;
-			PanelRect(true, center, width, height);
+		// panels (the desktop panel and the UI panels) win over the world; the
+		// nearest one hit takes the pointer, mapped to its window pixels
+		const int winX = globalRendering->winSizeX;
+		const int winY = globalRendering->winSizeY;
 
-			const XrVector3f& p = hand.aim.position;
-			const float t = (center.z - p.z) / dirXR.z;
-			const float u = (p.x + dirXR.x * t - center.x) / width + 0.5f;
-			const float v = (p.y + dirXR.y * t - center.y) / height + 0.5f;
+		if (winX > 0 && winY > 0) {
+			const float3 from = ToF3(hand.aim.position);
+			const float3 dir = ToF3(dirXR);
 
-			if (t > 0.0f && u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f) {
+			const auto TryPanel = [&](const PanelQuad& quad, int px, int py, int pw, int ph) {
+				float t = 0.0f, u = 0.0f, v = 0.0f;
+				if (!RayQuad(quad, from, dir, t, u, v) || (panelT > 0.0f && t >= panelT))
+					return;
+
 				in.onPanel = true;
-				in.panelX = std::min(static_cast<int>(u * globalRendering->winSizeX), globalRendering->winSizeX - 1);
-				in.panelY = std::min(static_cast<int>((1.0f - v) * globalRendering->winSizeY), globalRendering->winSizeY - 1);
+				in.panelX = std::clamp(px + static_cast<int>(u * pw), 0, winX - 1);
+				in.panelY = std::clamp(py + static_cast<int>((1.0f - v) * ph), 0, winY - 1);
 				panelT = t;
-				panelHitXR = {p.x + dirXR.x * t, p.y + dirXR.y * t, p.z + dirXR.z * t};
+				panelHitXR = ToXr(from + dir * t);
+			};
+
+			if (TVVisible(true)) {
+				PanelQuad tv;
+				float3 center;
+				PanelRect(true, center, tv.width, tv.height);
+				tv.pose.position = ToXr(center);
+				TryPanel(tv, 0, 0, winX, winY);
+			}
+
+			for (const UIPanelLayer& layer: uiLayers) {
+				if (layer.visible)
+					TryPanel(layer.quad, layer.x, layer.y, layer.w, layer.h);
 			}
 		}
 	}
@@ -900,8 +1245,9 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 	XrCompositionLayerProjectionView projViews[NUM_EYES];
 	XrCompositionLayerProjection projection = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
 	XrCompositionLayerQuad panel = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+	XrCompositionLayerQuad uiQuads[MAX_UI_LAYERS];
 
-	const XrCompositionLayerBaseHeader* layers[2];
+	const XrCompositionLayerBaseHeader* layers[2 + MAX_UI_LAYERS];
 	uint32_t layerCount = 0;
 
 	if (frameState.shouldRender && eyesDrawn) {
@@ -921,7 +1267,13 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 		layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
 	}
 
-	if (frameState.shouldRender && haveFrame && (showPanel || !eyesDrawn) && CopyBackBufferTo(mirror, 0, 0, globalRendering->winSizeX, globalRendering->winSizeY)) {
+	const int winX = globalRendering->winSizeX;
+	const int winY = globalRendering->winSizeY;
+	const bool inGameView = eyesDrawn && tableView;
+	const bool anyUI = inGameView && std::any_of(uiLayers.begin(), uiLayers.end(), [](const UIPanelLayer& l) { return l.visible; });
+	const bool resolved = frameState.shouldRender && haveFrame && (TVVisible(inGameView) || anyUI) && ResolveBackBuffer(0, 0, winX, winY);
+
+	if (resolved && TVVisible(inGameView) && BlitResolvedTo(mirror, 0, 0, winX, winY)) {
 		panel.space = localSpace;
 		panel.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
 		panel.subImage.swapchain = mirror.handle;
@@ -935,6 +1287,41 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 		panel.pose.position = {center.x, center.y, center.z};
 
 		layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&panel);
+	}
+
+	// the UI panels, each from its own swapchain sized like its window
+	// rectangle (recreated when that size changes), so the whole image is
+	// used and no sub-image origin convention is involved
+	int uiCount = 0;
+	for (UIPanelLayer& layer: uiLayers) {
+		if (!resolved || !anyUI || !layer.visible || uiCount >= MAX_UI_LAYERS)
+			continue;
+
+		if (layer.sc.handle != XR_NULL_HANDLE && (layer.sc.sizeX != layer.w || layer.sc.sizeY != layer.h)) {
+			xrDestroySwapchain(layer.sc.handle);
+			layer.sc = ColorSwapchain();
+		}
+		if (layer.sc.handle == XR_NULL_HANDLE && !CreateColorSwapchain(layer.w, layer.h, layer.sc)) {
+			layer.sc = ColorSwapchain();
+			continue;
+		}
+
+		// window rows count down from the top; GL rows count up from the bottom
+		if (!BlitResolvedTo(layer.sc, layer.x, winY - (layer.y + layer.h), layer.w, layer.h))
+			continue;
+
+		XrCompositionLayerQuad& quad = uiQuads[uiCount++];
+		quad = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+		quad.space = localSpace;
+		quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+		quad.subImage.swapchain = layer.sc.handle;
+		quad.subImage.imageRect.offset = {0, 0};
+		quad.subImage.imageRect.extent = {layer.sc.sizeX, layer.sc.sizeY};
+		quad.subImage.imageArrayIndex = 0;
+		quad.pose = layer.quad.pose;
+		quad.size = {layer.quad.width, layer.quad.height};
+
+		layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
 	}
 
 	XrFrameEndInfo frameEndInfo = {XR_TYPE_FRAME_END_INFO};
@@ -990,6 +1377,11 @@ void CVRManager::Init()
 	impl->worldScale = configHandler->GetFloat("VRWorldScale");
 	impl->mirrorDistance = configHandler->GetFloat("VRMirrorDistance");
 	impl->mirrorWidth = configHandler->GetFloat("VRMirrorWidth");
+	impl->uiPanelsEnabled = configHandler->GetBool("VRUIPanels");
+	impl->barScale = configHandler->GetFloat("VRBarScale");
+	impl->barMaxDistance = configHandler->GetFloat("VRBarMaxDistance");
+	impl->paletteScale = configHandler->GetFloat("VRPaletteScale");
+	impl->paletteTilt = configHandler->GetFloat("VRPaletteTilt") * 0.0174533f;
 
 	if (impl->CreateInstance() && impl->CreateSession() && impl->CreateSwapchains()) {
 		LOG("[VR] OpenXR session created (stereo=%d, view=%s); waiting for the runtime to start it", impl->stereo, impl->tableView ? "table" : "camera");
@@ -1049,14 +1441,21 @@ void CVRManager::UpdateDesktop()
 
 	if (!m.running || !m.tableView || !m.pointerEnabled || !VRPointer::InGame()) {
 		m.pointerHit = 0;
+		m.HideUIPanels();
 		VRPointer::Release();
 		return;
 	}
 
 	VRPointer::LockDesktopCamera(m.pointerMargin);
 
-	if (m.inputReady)
+	m.SyncUIPanels();
+
+	if (m.inputReady) {
+		m.LayoutUIPanels();
 		m.UpdatePointer();
+	} else {
+		m.HideUIPanels();
+	}
 }
 
 
