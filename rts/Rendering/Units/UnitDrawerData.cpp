@@ -226,7 +226,9 @@ static void UpdateUnitIconStateVR(CUnit* unit)
 		return;
 	}
 
-	const float dist = camera->GetPos().distance(unit->drawMidPos);
+	// the same answer for both eyes (judged from the farther one), so a unit is
+	// never a model in one eye and an icon in the other
+	const float dist = VRState::IconSwitchDistance(unit->drawMidPos);
 	unit->SetIsIcon(unit->radius < dist * VRState::iconSwitchTan);
 }
 

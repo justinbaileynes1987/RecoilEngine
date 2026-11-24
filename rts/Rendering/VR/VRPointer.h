@@ -27,7 +27,6 @@ namespace VRPointer {
 		float3 from;
 		float3 dir;
 		float length = 0.0f;
-		float3 eye;          // headset position in world space (icons are judged from here)
 
 		// the ray hits the floating desktop panel first, at this window pixel
 		// (x from the left, y from the top); the panel wins over the world

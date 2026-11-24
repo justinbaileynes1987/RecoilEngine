@@ -216,7 +216,6 @@ VRPointer::Result VRPointer::Update(const Input& in)
 
 		// pick along the controller ray, judging icons as the headset shows them
 		VRState::pickFromEye = true;
-		VRState::pickEyePos = in.eye;
 		const float dist = TraceRay::GuiTraceRay(in.from, in.dir, in.length, nullptr, hitUnit, hitFeature, true);
 		VRState::pickFromEye = false;
 

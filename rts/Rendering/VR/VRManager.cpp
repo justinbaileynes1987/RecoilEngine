@@ -56,14 +56,14 @@ CONFIG(float, VRTableHeight).defaultValue(-0.5f).description("Zero-K VR (table v
 CONFIG(float, VRTableX).defaultValue(0.0f).description("Zero-K VR (table view): sideways offset in metres of the table centre (positive = right).");
 CONFIG(float, VRTableYaw).defaultValue(0.0f).description("Zero-K VR (table view): rotation of the table in degrees, counter-clockwise seen from above.");
 CONFIG(float, VRWorldScale).defaultValue(300.0f).minimumValue(1.0f).description("Zero-K VR (camera view): game distance units (elmos) per real-world metre of head movement.");
-CONFIG(float, VRMirrorDistance).defaultValue(1.5f).minimumValue(0.3f).description("Zero-K VR: distance in metres from the starting head position to the desktop panel (UI). In-game with the table view, the panel stands behind the table instead.");
+CONFIG(float, VRMirrorDistance).defaultValue(2.2f).minimumValue(0.3f).description("Zero-K VR: distance in metres from the starting head position to the desktop panel (UI), like a TV on the war-room wall. It stays put when the table is moved or zoomed.");
 CONFIG(int, VRDebugCapture).defaultValue(0).minimumValue(0).description("Zero-K VR: if N > 0, save both eye images (vr-eye-0.png, vr-eye-1.png) to the write dir on the Nth frame that draws the eyes, and log the eye positions.");
 CONFIG(float, VRIconSwitchAngle).defaultValue(0.5f).minimumValue(0.0f).description("Zero-K VR: units whose radius looks smaller than this many degrees from the eye are drawn as icons in the stereo view. 0 always draws models.");
 CONFIG(float, VRIconSize).defaultValue(0.9f).minimumValue(0.05f).description("Zero-K VR: apparent width in degrees of unit icons in the stereo view (before the icon's own size multiplier).");
 CONFIG(bool, VRPanel).defaultValue(true).description("Zero-K VR: show the desktop frame (with the UI) as a floating panel. Turn off to see only the stereo view.");
-CONFIG(bool, VRPointer).defaultValue(true).description("Zero-K VR (table view): use the controller pointer as the mouse (trigger = left click, A/X = right click). The desktop camera is held over the whole map while VR runs, so every point the pointer reaches is on screen.");
+CONFIG(bool, VRPointer).defaultValue(true).description("Zero-K VR (table view): use the controller pointer as the mouse (pointer hand: trigger = left click, A/X = right click; other hand: trigger holds Shift). The desktop camera is held over the whole map while VR runs, so every point the pointer reaches is on screen.");
 CONFIG(float, VRPointerMargin).defaultValue(1.6f).minimumValue(1.0f).description("Zero-K VR (table view, pointer on): how much room the desktop view leaves around the map, as a multiple of the map size, so pointer clicks stay clear of the UI at the screen edges.");
-CONFIG(float, VRMirrorWidth).defaultValue(1.6f).minimumValue(0.1f).description("Zero-K VR: width in metres of the desktop panel (UI).");
+CONFIG(float, VRMirrorWidth).defaultValue(1.77f).minimumValue(0.1f).description("Zero-K VR: width in metres of the desktop panel (UI). The default, 1.77, is an 80-inch 16:9 TV.");
 
 
 namespace {
@@ -194,8 +194,8 @@ struct CVRManager::Impl
 	float tableDistance = 0.8f;
 	float tableHeight = -0.5f;
 	float worldScale = 300.0f;
-	float mirrorDistance = 1.5f;
-	float mirrorWidth = 1.6f;
+	float mirrorDistance = 2.2f;
+	float mirrorWidth = 1.77f;
 
 	bool showPanel = true;
 	int debugCaptureFrame = 0; // VRDebugCapture
@@ -782,10 +782,10 @@ void CVRManager::Impl::PanelRect(bool behindTable, float3& center, float& width,
 	height = mirrorWidth * aspect;
 
 	if (behindTable) {
-		// in-game: a screen on the war-room wall behind the table, its bottom
-		// edge at eye level so the table below stays in clear view
-		const float distance = tableDistance + tableSize * 0.5f + 0.3f;
-		center = float3(0.0f, height * 0.5f, -std::max(distance, mirrorDistance));
+		// in-game: a big TV on the war-room wall behind the table, fixed in the
+		// room (moving or zooming the table doesn't push it away), its bottom
+		// edge just below eye level so the table below stays in clear view
+		center = float3(0.0f, height * 0.5f - 0.1f, -mirrorDistance);
 	} else {
 		center = float3(0.0f, 0.0f, -mirrorDistance);
 	}
@@ -854,13 +854,11 @@ void CVRManager::Impl::UpdatePointer()
 		in.dir = m.Dir(dirXR).SafeNormalize();
 		in.length = POINTER_LENGTH * m.scale;
 
-		// the headset, for judging which units the eyes see as icons
-		// (falls back to the controller if the eyes aren't located yet)
-		in.eye = in.from;
+		// the eyes, for judging which units they see as icons (the pick runs
+		// before this frame's eyes are drawn, which also set these)
 		if (viewsValid) {
-			const XrVector3f& a = views[0].pose.position;
-			const XrVector3f& b = views[1].pose.position;
-			in.eye = m.Pos({(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f});
+			VRState::eyePos[0] = m.Pos(views[0].pose.position);
+			VRState::eyePos[1] = m.Pos(views[1].pose.position);
 		}
 
 		// the panel faces the player (+z); a hit on it wins over the world
@@ -1329,6 +1327,10 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 	std::vector<float3> selectionOutline;
 	if (impl->inputReady)
 		VRPointer::SelectionFootprint(selectionOutline);
+
+	// both eyes in the world, so per-eye decisions (unit icons) can agree
+	for (uint32_t i = 0; i < NUM_EYES; ++i)
+		VRState::eyePos[i] = ToWorldPos(impl->views[i].pose.position);
 
 	// keep the desktop camera for screen<->world queries made while the eyes
 	// are drawn (the mouse, Spring.TraceScreenRay, area-command previews)

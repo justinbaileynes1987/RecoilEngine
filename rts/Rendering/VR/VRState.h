@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include "System/float3.h"
 
 class CCamera;
@@ -45,10 +47,12 @@ namespace VRState {
 	};
 	inline CursorPick cursorPick;
 
-	// true while the pointer's own pick runs: unit icons are judged as seen
-	// from pickEyePos (the headset), like in the eye views
+	// true while the pointer's own pick runs: unit icons are judged as the
+	// eye views show them (IconSwitchDistance)
 	inline bool pickFromEye = false;
-	inline float3 pickEyePos;
+
+	// both eyes in world space, set by CVRManager::DrawEyes each frame
+	inline float3 eyePos[2];
 
 	// unit icons in the eye views, as tangents of angles seen from the eye:
 	// a unit whose radius looks smaller than iconSwitchTan is drawn as an icon,
@@ -56,4 +60,11 @@ namespace VRState {
 	// own size from its definition)
 	inline float iconSwitchTan = 0.0087f;   // ~0.5 degrees
 	inline float iconHalfSizeTan = 0.0079f; // ~0.9 degrees across
+
+	// the distance that decides whether a unit is an icon: the farther eye's,
+	// so both eyes agree (an icon in either eye is an icon in both) and a unit
+	// near the switch never shows as a model in one eye and an icon in the other
+	inline float IconSwitchDistance(const float3& pos) {
+		return std::max(eyePos[0].distance(pos), eyePos[1].distance(pos));
+	}
 }

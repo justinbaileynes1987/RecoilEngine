@@ -381,7 +381,7 @@ static bool VRPickIcon(const CUnit* u, float& iconRadius)
 
 	const unsigned short losStatus = u->losStatus[gu->myAllyTeam];
 
-	const float dist = VRState::pickEyePos.distance(u->drawMidPos);
+	const float dist = VRState::IconSwitchDistance(u->drawMidPos);
 	const auto& iconData = icon::iconHandler.GetIconData(u->currentIconIndex);
 
 	iconRadius = iconData.GetSize() * dist * VRState::iconHalfSizeTan;
