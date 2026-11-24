@@ -59,7 +59,8 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 	    !MakeAction(squeezeAction, XR_ACTION_TYPE_FLOAT_INPUT, "grab", "Grab the table") ||
 	    !MakeAction(triggerAction, XR_ACTION_TYPE_FLOAT_INPUT, "select", "Select / command") ||
 	    !MakeAction(thumbstickAction, XR_ACTION_TYPE_VECTOR2F_INPUT, "thumbstick", "Thumbstick") ||
-	    !MakeAction(commandAction, XR_ACTION_TYPE_BOOLEAN_INPUT, "command", "Command (right click)")) {
+	    !MakeAction(commandAction, XR_ACTION_TYPE_BOOLEAN_INPUT, "command", "Command (right click)") ||
+	    !MakeAction(stickClickAction, XR_ACTION_TYPE_BOOLEAN_INPUT, "pointer_hand", "Point with this hand")) {
 		Destroy();
 		return false;
 	}
@@ -102,6 +103,7 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 		{thumbstickAction, "/input/thumbstick"},
 		{commandAction, "/input/x/click", 1},
 		{commandAction, "/input/a/click", 2},
+		{stickClickAction, "/input/thumbstick/click"},
 	});
 	Suggest("/interaction_profiles/valve/index_controller", {
 		{gripPoseAction, "/input/grip/pose"},
@@ -110,6 +112,7 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 		{triggerAction, "/input/trigger/value"},
 		{thumbstickAction, "/input/thumbstick"},
 		{commandAction, "/input/a/click"},
+		{stickClickAction, "/input/thumbstick/click"},
 	});
 	Suggest("/interaction_profiles/htc/vive_controller", {
 		{gripPoseAction, "/input/grip/pose"},
@@ -126,6 +129,7 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 		{triggerAction, "/input/trigger/value"},
 		{thumbstickAction, "/input/thumbstick"},
 		{commandAction, "/input/trackpad/click"},
+		{stickClickAction, "/input/thumbstick/click"},
 	});
 
 	for (int h = 0; h < NUM_HANDS; ++h) {
@@ -184,6 +188,7 @@ void CVRInput::Destroy()
 	triggerAction = XR_NULL_HANDLE;
 	thumbstickAction = XR_NULL_HANDLE;
 	commandAction = XR_NULL_HANDLE;
+	stickClickAction = XR_NULL_HANDLE;
 }
 
 
@@ -233,6 +238,10 @@ void CVRInput::Update(XrSession session, XrSpace baseSpace, XrTime time)
 		XrActionStateBoolean boolState = {XR_TYPE_ACTION_STATE_BOOLEAN};
 		getInfo.action = commandAction;
 		hand.command = XR_SUCCEEDED(xrGetActionStateBoolean(session, &getInfo, &boolState)) && boolState.isActive && boolState.currentState;
+
+		boolState = {XR_TYPE_ACTION_STATE_BOOLEAN};
+		getInfo.action = stickClickAction;
+		hand.stickClick = XR_SUCCEEDED(xrGetActionStateBoolean(session, &getInfo, &boolState)) && boolState.isActive && boolState.currentState;
 
 		const auto LocatePose = [&](XrAction action, XrSpace space, XrPosef& pose) {
 			XrActionStatePose poseState = {XR_TYPE_ACTION_STATE_POSE};

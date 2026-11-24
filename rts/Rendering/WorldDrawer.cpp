@@ -483,7 +483,10 @@ void CWorldDrawer::DrawMiscObjects() const
 	lineDrawer.DrawAll();
 	cursorIcons.Draw();
 
-	mouse->DrawSelectionBox();
+	// Zero-K VR: the box is built for the desktop camera; the eye views draw
+	// its footprint on the ground instead (VRManager)
+	if (!VRState::eyePass)
+		mouse->DrawSelectionBox();
 	guihandler->DrawMapStuff(false);
 
 	if (globalRendering->drawMapMarks && !game->hideInterface) {

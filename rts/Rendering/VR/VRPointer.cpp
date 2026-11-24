@@ -6,17 +6,24 @@
 #include <cmath>
 #include <cstdlib>
 
+#include <SDL_keyboard.h>
 #include <SDL_mouse.h>
 
 #include "Game/Camera.h"
 #include "Game/CameraHandler.h"
 #include "Game/Game.h"
+#include "Game/GameController.h"
 #include "Game/TraceRay.h"
+#include "Game/UI/KeyBindings.h"
+#include "Game/UI/KeyCodes.h"
 #include "Game/UI/MouseHandler.h"
+#include "Game/UI/ScanCodes.h"
+#include "Map/Ground.h"
 #include "Map/ReadMap.h"
 #include "Rendering/GlobalRendering.h"
 #include "Sim/Misc/GlobalConstants.h"
 #include "Sim/Units/Unit.h"
+#include "System/Input/KeyInput.h"
 
 namespace {
 	constexpr int NUM_POINTER_BUTTONS = 2;
@@ -32,6 +39,7 @@ namespace {
 	bool yielded = false;
 	int anchorX = 0;
 	int anchorY = 0;
+	bool shiftDown = false; // the pointer is holding Shift
 }
 
 
@@ -61,8 +69,101 @@ void VRPointer::LockDesktopCamera(float margin)
 }
 
 
+bool VRPointer::SelectionFootprint(std::vector<float3>& outline)
+{
+	outline.clear();
+
+	if (!InGame())
+		return false;
+
+	// same conditions as the engine's own box (left drag past the threshold,
+	// not chorded, no Lua or map-draw grab)
+	float3 bl, br, tl, tr;
+	if (!mouse->GetSelectionBoxVertices(bl, br, tl, tr))
+		return false;
+
+	const CCamera* cam = CCameraHandler::GetCamera(CCamera::CAMTYPE_PLAYER);
+	const CMouseHandler::ButtonPressEvt& bp = mouse->buttons[SDL_BUTTON_LEFT];
+
+	// the box is a rectangle in window pixels; walk its edges and drop each
+	// point onto the terrain, so the outline follows hills and valleys
+	const float x0 = static_cast<float>(bp.x);
+	const float y0 = static_cast<float>(bp.y);
+	const float x1 = static_cast<float>(mouse->lastx);
+	const float y1 = static_cast<float>(mouse->lasty);
+	const float corners[4][2] = {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}};
+	constexpr int STEPS = 24; // points per edge
+
+	const float3 camPos = cam->GetPos();
+	const float rayLen = cam->GetFarPlaneDist() * 1.4f;
+
+	outline.reserve(4 * STEPS);
+
+	for (int e = 0; e < 4; ++e) {
+		const float* a = corners[e];
+		const float* b = corners[(e + 1) % 4];
+
+		for (int s = 0; s < STEPS; ++s) {
+			const float t = static_cast<float>(s) / STEPS;
+			const int px = static_cast<int>(a[0] + (b[0] - a[0]) * t);
+			const int py = static_cast<int>(a[1] + (b[1] - a[1]) * t);
+			const float3 dir = cam->CalcPixelDir(px, py);
+
+			// unsynced heightmap query: rendering only
+			const float dist = CGround::LineGroundCol(camPos, camPos + dir * rayLen, false);
+
+			if (dist >= 0.0f) {
+				outline.push_back(camPos + dir * dist);
+			} else if (dir.y < -1e-4f) {
+				// off the map: use the sea-level plane
+				outline.push_back(camPos + dir * (-camPos.y / dir.y));
+			}
+		}
+	}
+
+	return (outline.size() >= 3);
+}
+
+
+void VRPointer::SetShift(bool down)
+{
+	if (down == shiftDown)
+		return;
+
+	shiftDown = down;
+
+	// the same path as debug.emulateKeyPress/Release: the emulated key is merged
+	// with the real keyboard in KeyInput::Update, so GetKeyModState, Lua's
+	// GetModKeyState and the queue-order logic all see Shift held
+	constexpr SDL_Keycode key = SDLK_LSHIFT;
+	const SDL_Scancode sc = SDL_GetScancodeFromKey(key);
+
+	int numKeys = 0;
+	const uint8_t* kbState = SDL_GetKeyboardState(&numKeys);
+	const bool physicalDown = (kbState != nullptr && static_cast<int>(sc) < numKeys && kbState[sc] != 0);
+
+	KeyInput::SetKeyEmulated(key, down);
+	KeyInput::Update(keyBindings.GetFakeMetaKey());
+
+	// press and release events, unless the real Shift key is already down
+	if (activeController == nullptr || physicalDown)
+		return;
+
+	const int keyCode = CKeyCodes::GetNormalizedSymbol(key);
+	const int scanCode = CScanCodes::GetNormalizedSymbol(sc);
+
+	if (down) {
+		activeController->KeyPressed(keyCode, scanCode, false);
+	} else {
+		activeController->KeyReleased(keyCode, scanCode);
+	}
+}
+
+
 void VRPointer::Release()
 {
+	SetShift(false);
+
 	if (mouse == nullptr) {
 		std::fill(std::begin(held), std::end(held), false);
 		return;

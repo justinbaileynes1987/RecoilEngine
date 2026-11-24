@@ -39,6 +39,7 @@
 // clash with OpenXR struct members of the same name
 #include "Game/Camera.h"
 #include "Game/CameraHandler.h"
+#include "Game/UI/CommandColors.h"
 #include "Map/Ground.h"
 #include "Map/ReadMap.h"
 #include "Sim/Misc/GlobalConstants.h"
@@ -217,8 +218,14 @@ struct CVRManager::Impl
 	// controller pointer as the mouse (table view, in-game)
 	bool pointerEnabled = true;
 	float pointerMargin = 1.6f;
-	int pointerHand = 1;           // hand that drives the pointer; the last one to click
-	bool pointerButtons[CVRInput::NUM_HANDS][2] = {}; // [hand][0 = trigger, 1 = command], debounced
+	// the pointer hand clicks (trigger = left, A/X = right); the other hand's
+	// trigger holds Shift. A thumbstick click or A/X on the other hand moves
+	// the pointer to it.
+	enum TriggerRole { TRIGGER_NONE, TRIGGER_CLICK, TRIGGER_SHIFT };
+	int pointerHand = 1;           // hand that drives the pointer
+	bool pointerButtons[CVRInput::NUM_HANDS][3] = {}; // [hand][0 = trigger, 1 = command, 2 = stick click], debounced
+	int triggerRole[CVRInput::NUM_HANDS] = {};        // what each held trigger does, fixed at its press
+	bool commandClick[CVRInput::NUM_HANDS] = {};      // A/X held as the right button
 	int pointerHit = 0;            // this frame: 0 nothing, 1 world, 2 panel
 	float3 pointerHitPos;          // world position of the hit (on the panel: mapped into the world)
 	void UpdatePointer();
@@ -789,31 +796,51 @@ void CVRManager::Impl::UpdatePointer()
 {
 	pointerHit = 0;
 
-	// debounce the buttons; the hand that clicks last drives the pointer
-	int pressedHand = -1;
+	// debounce the buttons and find this frame's presses
+	bool pressed[CVRInput::NUM_HANDS][3] = {};
 	for (int h = 0; h < CVRInput::NUM_HANDS; ++h) {
 		const VRHandState& hand = input.Hand(h);
 		bool* b = pointerButtons[h];
+		const bool now[3] = {hand.trigger > (b[0] ? 0.4f : 0.6f), hand.command, hand.stickClick};
 
-		const bool trigger = hand.trigger > (b[0] ? 0.4f : 0.6f);
-		if ((trigger && !b[0]) || (hand.command && !b[1]))
-			pressedHand = h;
-
-		b[0] = trigger;
-		b[1] = hand.command;
+		for (int i = 0; i < 3; ++i) {
+			pressed[h][i] = now[i] && !b[i];
+			b[i] = now[i];
+		}
 	}
 
-	const bool activeHeld = pointerButtons[pointerHand][0] || pointerButtons[pointerHand][1];
-	if (pressedHand >= 0 && pressedHand != pointerHand && !activeHeld) {
-		// switching hands: let go of anything the old hand held first
-		VRPointer::Release();
-		pointerHand = pressedHand;
+	// a thumbstick click or A/X on the other hand moves the pointer there, once
+	// the pointer hand holds no mouse button (A/X then also right-clicks, as before)
+	const int otherHand = 1 - pointerHand;
+	const bool pointerBusy = (triggerRole[pointerHand] == TRIGGER_CLICK) || commandClick[pointerHand];
+	if ((pressed[otherHand][1] || pressed[otherHand][2]) && !pointerBusy)
+		pointerHand = otherHand;
+
+	// what a trigger does is decided when it is pressed and kept until release,
+	// so a hand switch never turns a held Shift into a click or the reverse
+	bool shift = false;
+	for (int h = 0; h < CVRInput::NUM_HANDS; ++h) {
+		if (!pointerButtons[h][0]) {
+			triggerRole[h] = TRIGGER_NONE;
+		} else if (pressed[h][0]) {
+			triggerRole[h] = (h == pointerHand) ? TRIGGER_CLICK : TRIGGER_SHIFT;
+		}
+
+		if (!pointerButtons[h][1]) {
+			commandClick[h] = false;
+		} else if (pressed[h][1] && h == pointerHand) {
+			commandClick[h] = true;
+		}
+
+		shift |= (triggerRole[h] == TRIGGER_SHIFT);
 	}
+
+	VRPointer::SetShift(shift);
 
 	const VRHandState& hand = input.Hand(pointerHand);
 	VRPointer::Input in;
-	in.left = pointerButtons[pointerHand][0];
-	in.right = pointerButtons[pointerHand][1];
+	in.left = (triggerRole[pointerHand] == TRIGGER_CLICK);
+	in.right = commandClick[pointerHand];
 
 	const XrToWorld m = TableMapping(table);
 	float panelT = -1.0f;
@@ -1103,12 +1130,19 @@ struct HandVisual {
 	float3 rayTo;
 	bool rayHit = false; // rayTo is on the ground
 	float markerSize = 0.0f;
-	bool triggered = false;
+	SColor rayCol = SColor(220, 225, 235, 255);
 };
 
-static void DrawHands(const CCamera* cam, const HandVisual* hands, int numHands)
+static void DrawHands(const CCamera* cam, const HandVisual* hands, int numHands, const std::vector<float3>& selectionOutline, float lift)
 {
 	auto& rb = RenderBuffer::GetTypedRenderBuffer<VA_TYPE_C>();
+
+	// the drag-selection box, lying on the ground (closed loop)
+	const SColor boxCol(cmdColors.mouseBox);
+	for (size_t i = 0, n = selectionOutline.size(); i < n; ++i) {
+		rb.AddVertex({selectionOutline[i] + float3(0.0f, lift, 0.0f), boxCol});
+		rb.AddVertex({selectionOutline[(i + 1) % n] + float3(0.0f, lift, 0.0f), boxCol});
+	}
 
 	for (int h = 0; h < numHands; ++h) {
 		const HandVisual& hv = hands[h];
@@ -1126,7 +1160,7 @@ static void DrawHands(const CCamera* cam, const HandVisual* hands, int numHands)
 		}
 
 		if (hv.aimValid) {
-			const SColor rayCol = hv.triggered ? SColor(255, 160, 40, 255) : SColor(220, 225, 235, 255);
+			const SColor rayCol = hv.rayCol;
 			rb.AddVertex({hv.rayFrom, rayCol});
 			rb.AddVertex({hv.rayTo, rayCol});
 
@@ -1256,7 +1290,14 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 				const float maxLen = POINTER_LENGTH * scale;
 
 				hv.rayFrom = ToWorldPos(hand.aim.position);
-				hv.triggered = (hand.trigger > 0.5f);
+				// pointer hand: white, orange while a mouse button is held;
+				// other hand: dim grey, cyan while its trigger holds Shift
+				if (h == impl->pointerHand) {
+					const bool clicking = (impl->triggerRole[h] == Impl::TRIGGER_CLICK) || impl->commandClick[h];
+					hv.rayCol = clicking ? SColor(255, 160, 40, 255) : SColor(220, 225, 235, 255);
+				} else {
+					hv.rayCol = (impl->triggerRole[h] == Impl::TRIGGER_SHIFT) ? SColor(60, 200, 255, 255) : SColor(110, 115, 125, 255);
+				}
 				hv.markerSize = 0.008f * scale;
 
 				// unsynced heightmap query: rendering only, never game state
@@ -1274,6 +1315,11 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 			}
 		}
 	}
+
+	// the selection box's footprint, traced while the camera is still the desktop one
+	std::vector<float3> selectionOutline;
+	if (impl->inputReady)
+		VRPointer::SelectionFootprint(selectionOutline);
 
 	bool ok = true;
 
@@ -1343,7 +1389,7 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 			DrawGreyboxRoom(cam, xrToWorld, scale, impl->tableHeight, impl->tableDistance);
 		}
 		if (impl->inputReady)
-			DrawHands(cam, handVisuals, CVRInput::NUM_HANDS);
+			DrawHands(cam, handVisuals, CVRInput::NUM_HANDS, selectionOutline, 0.002f * scale);
 
 		if (logThisFrame) {
 			const float3 p = cam->GetPos();

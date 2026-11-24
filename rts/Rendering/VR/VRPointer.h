@@ -8,6 +8,8 @@
 // Kept apart from VRManager.cpp because it needs sim headers that do not mix
 // with windows.h and OpenXR.
 
+#include <vector>
+
 #include "System/float3.h"
 
 namespace VRPointer {
@@ -44,6 +46,15 @@ namespace VRPointer {
 	// call once per frame after LockDesktopCamera, before the mouse handler updates
 	Result Update(const Input& in);
 
-	// let go of any button the pointer is holding down
+	// the drag-selection box as a closed outline on the ground (world space),
+	// traced from the desktop camera; false when no box is being dragged.
+	// Call while the player camera still has its desktop pose.
+	bool SelectionFootprint(std::vector<float3>& outline);
+
+	// holds Shift down (queue orders) while true, as if the key were held on
+	// the keyboard: the key state, plus the press and release events
+	void SetShift(bool down);
+
+	// let go of any button the pointer is holding down, and of Shift
 	void Release();
 }
