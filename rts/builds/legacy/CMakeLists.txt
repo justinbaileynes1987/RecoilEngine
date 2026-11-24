@@ -89,7 +89,10 @@ if (ENABLE_OPENXR)
 	if (NOT WIN32)
 		message(FATAL_ERROR "ENABLE_OPENXR currently supports Windows builds only")
 	endif()
-	target_sources(engine-legacy PRIVATE "${ENGINE_SRC_ROOT_DIR}/Rendering/VR/VRManager.cpp")
+	target_sources(engine-legacy PRIVATE
+		"${ENGINE_SRC_ROOT_DIR}/Rendering/VR/VRManager.cpp"
+		"${ENGINE_SRC_ROOT_DIR}/Rendering/VR/VRInput.cpp"
+	)
 	target_compile_definitions(engine-legacy PRIVATE ENABLE_OPENXR)
 	target_compile_definitions(Game PRIVATE ENABLE_OPENXR)
 	target_link_libraries(engine-legacy openxr_loader)

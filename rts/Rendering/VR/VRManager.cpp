@@ -32,10 +32,13 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include "Rendering/VR/VRInput.h"
+
 // after the OpenXR headers: Camera.h defines a `camera` macro that would
 // clash with OpenXR struct members of the same name
 #include "Game/Camera.h"
 #include "Game/CameraHandler.h"
+#include "Map/Ground.h"
 #include "Map/ReadMap.h"
 #include "Sim/Misc/GlobalConstants.h"
 #include "Rendering/Env/ISky.h"
@@ -48,6 +51,8 @@ CONFIG(std::string, VRView).defaultValue("table").description("Zero-K VR: 'table
 CONFIG(float, VRTableSize).defaultValue(1.2f).minimumValue(0.1f).description("Zero-K VR (table view): length in metres of the longest side of the map on the table.");
 CONFIG(float, VRTableDistance).defaultValue(0.8f).description("Zero-K VR (table view): metres from the starting head position to the table centre.");
 CONFIG(float, VRTableHeight).defaultValue(-0.5f).description("Zero-K VR (table view): height in metres of the table surface relative to the starting eye height.");
+CONFIG(float, VRTableX).defaultValue(0.0f).description("Zero-K VR (table view): sideways offset in metres of the table centre (positive = right).");
+CONFIG(float, VRTableYaw).defaultValue(0.0f).description("Zero-K VR (table view): rotation of the table in degrees, counter-clockwise seen from above.");
 CONFIG(float, VRWorldScale).defaultValue(300.0f).minimumValue(1.0f).description("Zero-K VR (camera view): game distance units (elmos) per real-world metre of head movement.");
 CONFIG(float, VRMirrorDistance).defaultValue(1.5f).minimumValue(0.3f).description("Zero-K VR: distance in metres from the starting head position to the desktop panel (UI). In-game with the table view, the panel stands behind the table instead.");
 CONFIG(int, VRDebugCapture).defaultValue(0).minimumValue(0).description("Zero-K VR: if N > 0, save both eye images (vr-eye-0.png, vr-eye-1.png) to the write dir on the Nth frame that draws the eyes, and log the eye positions.");
@@ -77,6 +82,40 @@ namespace {
 		const float3 r = vv + qv.cross(t) * 2.0f;
 		return {r.x, r.y, r.z};
 	}
+
+	float3 ToF3(const XrVector3f& v) { return {v.x, v.y, v.z}; }
+
+	// rotate v by angle a (radians) about the vertical axis; positive is
+	// counter-clockwise seen from above (OpenXR: +x right, +y up, -z forward)
+	float3 RotY(const float3& v, float a)
+	{
+		const float c = std::cos(a);
+		const float s = std::sin(a);
+		return {v.x * c + v.z * s, v.y, -v.x * s + v.z * c};
+	}
+
+	// heading of a direction on the horizontal plane, in RotY's convention
+	// (RotY(YawOf(v), forward) points along v)
+	float YawOf(const float3& v) { return std::atan2(-v.x, -v.z); }
+
+	float WrapAngle(float a)
+	{
+		constexpr float PI = 3.14159265f;
+		while (a >  PI) a -= 2.0f * PI;
+		while (a < -PI) a += 2.0f * PI;
+		return a;
+	}
+
+	// where the map sits in the room (OpenXR LOCAL space): its centre at sea
+	// level, its rotation about the vertical, and the length of its longest side
+	struct TablePose {
+		float3 center = {0.0f, -0.5f, -0.8f};
+		float yaw = 0.0f;
+		float size = 1.2f;
+	};
+
+	constexpr float MIN_TABLE_SIZE = 0.2f;   // metres
+	constexpr float MAX_TABLE_SIZE = 200.0f; // metres; large enough to stand inside a base
 }
 
 
@@ -123,6 +162,20 @@ struct CVRManager::Impl
 	bool showPanel = true;
 	int debugCaptureFrame = 0; // VRDebugCapture
 	int eyeFrames = 0;         // frames on which the eyes were drawn
+
+	// controllers and the movable table
+	CVRInput input;
+	bool inputReady = false;
+	TablePose table;        // current placement (table view)
+	TablePose grabStart;    // placement when the current grab began
+	float3 grabAnchor;      // hand position (one hand) or midpoint (two) at grab start
+	float grabYaw0 = 0.0f;  // heading between the hands at grab start
+	float grabDist0 = 1.0f; // distance between the hands at grab start
+	int grabMask = 0;       // bit h set while hand h holds the table
+	bool tableMoved = false;
+
+	void UpdateTable();
+	void SaveTable() const;
 
 	bool Check(XrResult result, const char* what) const;
 
@@ -262,7 +315,15 @@ bool CVRManager::Impl::CreateSession()
 	spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
 	spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
 
-	return Check(xrCreateReferenceSpace(session, &spaceInfo, &localSpace), "xrCreateReferenceSpace");
+	if (!Check(xrCreateReferenceSpace(session, &spaceInfo, &localSpace), "xrCreateReferenceSpace"))
+		return false;
+
+	// controllers are optional: without them the view still works
+	inputReady = input.Init(instance, session);
+	if (!inputReady)
+		LOG_L(L_WARNING, "[VR] controller input unavailable; continuing without it");
+
+	return true;
 }
 
 
@@ -389,6 +450,10 @@ void CVRManager::Impl::Destroy()
 		*sc = ColorSwapchain();
 	}
 
+	input.Destroy();
+	inputReady = false;
+	grabMask = 0;
+
 	if (localSpace != XR_NULL_HANDLE) {
 		xrDestroySpace(localSpace);
 		localSpace = XR_NULL_HANDLE;
@@ -443,6 +508,9 @@ void CVRManager::Impl::PollEvents()
 			} break;
 			case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING: {
 				lost = true;
+			} break;
+			case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED: {
+				input.LogProfiles(instance, session);
 			} break;
 			default: {
 			} break;
@@ -569,6 +637,87 @@ bool CVRManager::Impl::CopyBackBufferTo(ColorSwapchain& sc, int srcX, int srcY, 
 }
 
 
+// grab the table with the grip button: one hand moves it, two hands also
+// turn it (around the vertical) and zoom it (by the change in hand distance)
+void CVRManager::Impl::UpdateTable()
+{
+	if (!tableView || !inputReady)
+		return;
+
+	int mask = 0;
+	for (int h = 0; h < CVRInput::NUM_HANDS; ++h) {
+		const VRHandState& hand = input.Hand(h);
+		const bool wasHeld = ((grabMask >> h) & 1) != 0;
+		// hysteresis so a half-pressed grip does not flicker
+		const bool held = hand.gripValid && (hand.squeeze > (wasHeld ? 0.35f : 0.65f));
+		mask |= (held ? 1 : 0) << h;
+	}
+
+	const float3 leftPos = ToF3(input.Hand(0).grip.position);
+	const float3 rightPos = ToF3(input.Hand(1).grip.position);
+
+	// a hand was added or released: restart the gesture from where things are
+	if (mask != grabMask) {
+		grabMask = mask;
+		grabStart = table;
+
+		switch (mask) {
+			case 1: { grabAnchor = leftPos;  } break;
+			case 2: { grabAnchor = rightPos; } break;
+			case 3: {
+				const float3 span = rightPos - leftPos;
+				grabAnchor = (leftPos + rightPos) * 0.5f;
+				grabYaw0 = YawOf(span);
+				grabDist0 = std::max(span.Length(), 0.01f);
+			} break;
+			default: {} break;
+		}
+		return;
+	}
+
+	switch (mask) {
+		case 1:
+		case 2: {
+			const float3 handPos = (mask == 1) ? leftPos : rightPos;
+			table.center = grabStart.center + (handPos - grabAnchor);
+		} break;
+		case 3: {
+			const float3 span = rightPos - leftPos;
+			const float3 mid = (leftPos + rightPos) * 0.5f;
+
+			const float newSize = std::clamp(grabStart.size * (span.Length() / grabDist0), MIN_TABLE_SIZE, MAX_TABLE_SIZE);
+			const float zoom = newSize / grabStart.size;
+			const float turn = WrapAngle(YawOf(span) - grabYaw0);
+
+			table.size = newSize;
+			table.yaw = WrapAngle(grabStart.yaw + turn);
+			table.center = mid + RotY((grabStart.center - grabAnchor) * zoom, turn);
+		} break;
+		default: {
+			return;
+		} break;
+	}
+
+	tableMoved = true;
+}
+
+
+void CVRManager::Impl::SaveTable() const
+{
+	if (!tableMoved)
+		return;
+
+	configHandler->Set("VRTableSize", table.size);
+	configHandler->Set("VRTableX", table.center.x);
+	configHandler->Set("VRTableHeight", table.center.y);
+	configHandler->Set("VRTableDistance", -table.center.z);
+	configHandler->Set("VRTableYaw", table.yaw * (180.0f / 3.14159265f));
+
+	LOG("[VR] saved table placement: size %.2f m, centre (%.2f, %.2f, %.2f) m, turned %.0f degrees",
+		table.size, table.center.x, table.center.y, table.center.z, table.yaw * (180.0f / 3.14159265f));
+}
+
+
 void CVRManager::Impl::SubmitFrame(bool haveFrame)
 {
 	XrCompositionLayerProjectionView projViews[NUM_EYES];
@@ -665,6 +814,9 @@ void CVRManager::Init()
 	impl->tableSize = configHandler->GetFloat("VRTableSize");
 	impl->tableDistance = configHandler->GetFloat("VRTableDistance");
 	impl->tableHeight = configHandler->GetFloat("VRTableHeight");
+	impl->table.size = impl->tableSize;
+	impl->table.center = float3(configHandler->GetFloat("VRTableX"), impl->tableHeight, -impl->tableDistance);
+	impl->table.yaw = configHandler->GetFloat("VRTableYaw") * (3.14159265f / 180.0f);
 	impl->worldScale = configHandler->GetFloat("VRWorldScale");
 	impl->mirrorDistance = configHandler->GetFloat("VRMirrorDistance");
 	impl->mirrorWidth = configHandler->GetFloat("VRMirrorWidth");
@@ -681,6 +833,7 @@ void CVRManager::Init()
 
 void CVRManager::Kill()
 {
+	impl->SaveTable();
 	impl->Destroy();
 }
 
@@ -711,6 +864,11 @@ void CVRManager::BeginFrame()
 
 	if (impl->frameState.shouldRender)
 		impl->LocateViews();
+
+	if (impl->inputReady) {
+		impl->input.Update(impl->session, impl->localSpace, impl->frameState.predictedDisplayTime);
+		impl->UpdateTable();
+	}
 }
 
 
@@ -779,6 +937,78 @@ static void DrawGreyboxRoom(const CCamera* cam, const ToWorld& toWorld, float sc
 }
 
 
+// controller visuals for the eye views, in world coordinates (elmos)
+struct HandVisual {
+	bool gripValid = false;
+	float3 gripPos;
+	float3 gripAxes[3]; // short x (red), y (green), z (blue) axis lines
+	bool held = false;  // gripping the table
+
+	bool aimValid = false;
+	float3 rayFrom;
+	float3 rayTo;
+	bool rayHit = false; // rayTo is on the ground
+	float markerSize = 0.0f;
+	bool triggered = false;
+};
+
+static void DrawHands(const CCamera* cam, const HandVisual* hands, int numHands)
+{
+	auto& rb = RenderBuffer::GetTypedRenderBuffer<VA_TYPE_C>();
+
+	for (int h = 0; h < numHands; ++h) {
+		const HandVisual& hv = hands[h];
+
+		if (hv.gripValid) {
+			const SColor axisCols[3] = {
+				hv.held ? SColor(255, 220, 80, 255) : SColor(230, 70, 60, 255),
+				hv.held ? SColor(255, 220, 80, 255) : SColor(80, 220, 90, 255),
+				hv.held ? SColor(255, 220, 80, 255) : SColor(80, 120, 240, 255),
+			};
+			for (int a = 0; a < 3; ++a) {
+				rb.AddVertex({hv.gripPos, axisCols[a]});
+				rb.AddVertex({hv.gripPos + hv.gripAxes[a], axisCols[a]});
+			}
+		}
+
+		if (hv.aimValid) {
+			const SColor rayCol = hv.triggered ? SColor(255, 160, 40, 255) : SColor(220, 225, 235, 255);
+			rb.AddVertex({hv.rayFrom, rayCol});
+			rb.AddVertex({hv.rayTo, rayCol});
+
+			if (hv.rayHit) {
+				const float m = hv.markerSize;
+				const float3 p = hv.rayTo;
+				rb.AddVertex({p - float3(m, 0.0f, 0.0f), rayCol}); rb.AddVertex({p + float3(m, 0.0f, 0.0f), rayCol});
+				rb.AddVertex({p - float3(0.0f, 0.0f, m), rayCol}); rb.AddVertex({p + float3(0.0f, 0.0f, m), rayCol});
+				rb.AddVertex({p, rayCol});                         rb.AddVertex({p + float3(0.0f, m * 2.0f, 0.0f), rayCol});
+			}
+		}
+	}
+
+	if (!rb.ShouldSubmit())
+		return;
+
+	auto& shader = rb.GetShader();
+
+	glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadMatrixf(cam->GetProjectionMatrix());
+	glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadMatrixf(cam->GetViewMatrix());
+
+	// always visible: the pointer must show even where terrain is in the way
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_BLEND);
+
+	shader.Enable();
+	rb.DrawArrays(GL_LINES);
+	shader.Disable();
+
+	glEnable(GL_DEPTH_TEST);
+
+	glMatrixMode(GL_PROJECTION); glPopMatrix();
+	glMatrixMode(GL_MODELVIEW);  glPopMatrix();
+}
+
+
 // debug aid: save a rectangle of the default framebuffer's back buffer as a PNG
 static void CaptureBackBuffer(const std::string& filename, int x, int y, int sizeX, int sizeY)
 {
@@ -824,11 +1054,17 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 		const float mapSizeX = static_cast<float>(mapDims.mapx * SQUARE_SIZE);
 		const float mapSizeZ = static_cast<float>(mapDims.mapy * SQUARE_SIZE);
 
-		scale = std::max(mapSizeX, mapSizeZ) / impl->tableSize;
+		// placement comes from impl->table (moved, turned and zoomed by the
+		// controllers): XR = table.center + RotY(table.yaw, map-local)
+		const TablePose& tp = impl->table;
+		const float c = std::cos(tp.yaw);
+		const float s = std::sin(tp.yaw);
+
+		scale = std::max(mapSizeX, mapSizeZ) / tp.size;
 		origin = float3(mapSizeX * 0.5f, 0.0f, mapSizeZ * 0.5f);
-		xrOrigin = float3(0.0f, impl->tableHeight, -impl->tableDistance);
-		axisX = float3(1.0f, 0.0f, 0.0f);
-		axisZ = float3(0.0f, 0.0f, 1.0f);
+		xrOrigin = tp.center;
+		axisX = float3(c, 0.0f, s);  // RotY(-yaw) applied to XR +x
+		axisZ = float3(-s, 0.0f, c); // RotY(-yaw) applied to XR +z
 	} else {
 		// anchored at the player camera, keeping only its heading so the
 		// horizon stays level
@@ -854,6 +1090,38 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 	const auto ToWorldPos = [&](const XrVector3f& p) {
 		return origin + ToWorldDir({p.x - xrOrigin.x, p.y - xrOrigin.y, p.z - xrOrigin.z}) * scale;
 	};
+
+	// controllers, mapped into the world once per frame (same for both eyes)
+	HandVisual handVisuals[CVRInput::NUM_HANDS];
+	if (impl->inputReady) {
+		for (int h = 0; h < CVRInput::NUM_HANDS; ++h) {
+			const VRHandState& hand = impl->input.Hand(h);
+			HandVisual& hv = handVisuals[h];
+
+			if ((hv.gripValid = hand.gripValid)) {
+				hv.gripPos = ToWorldPos(hand.grip.position);
+				hv.gripAxes[0] = ToWorldDir(Rotate(hand.grip.orientation, {0.04f, 0.0f, 0.0f})) * scale;
+				hv.gripAxes[1] = ToWorldDir(Rotate(hand.grip.orientation, {0.0f, 0.04f, 0.0f})) * scale;
+				hv.gripAxes[2] = ToWorldDir(Rotate(hand.grip.orientation, {0.0f, 0.0f, 0.04f})) * scale;
+				hv.held = ((impl->grabMask >> h) & 1) != 0;
+			}
+
+			if ((hv.aimValid = hand.aimValid)) {
+				const float3 dir = ToWorldDir(Rotate(hand.aim.orientation, {0.0f, 0.0f, -1.0f})).SafeNormalize();
+				const float maxLen = 5.0f * scale; // 5 m of pointer
+
+				hv.rayFrom = ToWorldPos(hand.aim.position);
+				hv.triggered = (hand.trigger > 0.5f);
+				hv.markerSize = 0.008f * scale;
+
+				// unsynced heightmap query: rendering only, never game state
+				const float hitDist = CGround::LineGroundCol(hv.rayFrom, hv.rayFrom + dir * maxLen, false);
+
+				hv.rayHit = (hitDist >= 0.0f);
+				hv.rayTo = hv.rayFrom + dir * (hv.rayHit ? hitDist : (0.4f * scale));
+			}
+		}
+	}
 
 	bool ok = true;
 
@@ -922,6 +1190,8 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 			const auto xrToWorld = [&](float x, float y, float z) { return ToWorldPos(XrVector3f{x, y, z}); };
 			DrawGreyboxRoom(cam, xrToWorld, scale, impl->tableHeight, impl->tableDistance);
 		}
+		if (impl->inputReady)
+			DrawHands(cam, handVisuals, CVRInput::NUM_HANDS);
 
 		if (logThisFrame) {
 			const float3 p = cam->GetPos();
