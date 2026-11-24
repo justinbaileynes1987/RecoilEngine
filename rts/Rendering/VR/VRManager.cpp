@@ -90,6 +90,15 @@ struct CVRManager::Impl
 	ColorSwapchain eyes[NUM_EYES];
 	GLuint blitFBO = 0;
 
+	// single-sampled copy of the back buffer: the default framebuffer may be
+	// multisampled (MSAALevel), and a multisampled source can only be blitted
+	// at the same size, so resolve here first and scale from this texture
+	GLuint resolveFBO = 0;
+	GLuint resolveTex = 0;
+	int resolveSizeX = 0;
+	int resolveSizeY = 0;
+	bool loggedBlitError = false;
+
 	XrSessionState state = XR_SESSION_STATE_UNKNOWN;
 	bool running = false;
 
@@ -360,6 +369,16 @@ void CVRManager::Impl::Destroy()
 		glDeleteFramebuffers(1, &blitFBO);
 		blitFBO = 0;
 	}
+	if (resolveFBO != 0) {
+		glDeleteFramebuffers(1, &resolveFBO);
+		resolveFBO = 0;
+	}
+	if (resolveTex != 0) {
+		glDeleteTextures(1, &resolveTex);
+		resolveTex = 0;
+	}
+	resolveSizeX = 0;
+	resolveSizeY = 0;
 
 	for (ColorSwapchain* sc: {&mirror, &eyes[0], &eyes[1]}) {
 		if (sc->handle != XR_NULL_HANDLE)
@@ -485,15 +504,54 @@ bool CVRManager::Impl::CopyBackBufferTo(ColorSwapchain& sc, int srcX, int srcY, 
 	glDisable(GL_SCISSOR_TEST);
 	glDisable(GL_FRAMEBUFFER_SRGB);
 
-	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, blitFBO);
-	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sc.images[imageIndex].image, 0);
-	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+	// drop errors raised before this point so the check below is about the copy
+	while (glGetError() != GL_NO_ERROR) {}
 
+	// 1. resolve (same size, so legal for a multisampled back buffer)
+	if (resolveSizeX != srcSizeX || resolveSizeY != srcSizeY) {
+		if (resolveTex == 0)
+			glGenTextures(1, &resolveTex);
+		if (resolveFBO == 0)
+			glGenFramebuffers(1, &resolveFBO);
+
+		GLint prevTex = 0;
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+		glBindTexture(GL_TEXTURE_2D, resolveTex);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, srcSizeX, srcSizeY, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glBindTexture(GL_TEXTURE_2D, prevTex);
+
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, resolveFBO);
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, resolveTex, 0);
+
+		resolveSizeX = srcSizeX;
+		resolveSizeY = srcSizeY;
+	}
+
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, resolveFBO);
 	glBlitFramebuffer(
 		srcX, srcY, srcX + srcSizeX, srcY + srcSizeY,
+		0, 0, srcSizeX, srcSizeY,
+		GL_COLOR_BUFFER_BIT, GL_NEAREST
+	);
+
+	// 2. scale into the swapchain image
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, resolveFBO);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, blitFBO);
+	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sc.images[imageIndex].image, 0);
+	glBlitFramebuffer(
+		0, 0, srcSizeX, srcSizeY,
 		0, 0, sc.sizeX, sc.sizeY,
 		GL_COLOR_BUFFER_BIT, GL_LINEAR
 	);
+
+	const GLenum glErr = glGetError();
+	if (glErr != GL_NO_ERROR && !loggedBlitError) {
+		LOG_L(L_ERROR, "[VR] copy into a swapchain image failed: GL error 0x%x (source %dx%d, target %dx%d)", glErr, srcSizeX, srcSizeY, sc.sizeX, sc.sizeY);
+		loggedBlitError = true;
+	}
 
 	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
 	glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFBO);
