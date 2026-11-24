@@ -33,6 +33,14 @@ public:
 	void BeginFrame();
 
 	/**
+	 * Call in-game right after the camera controller updates, before the mouse
+	 * handler. In the table view with VRPointer on, holds the desktop camera
+	 * over the whole map and feeds the controller pointer in as mouse moves
+	 * and clicks (aimed at the world or at the floating desktop panel).
+	 */
+	void UpdateDesktop();
+
+	/**
 	 * Call from the game's draw, before the desktop world is drawn. Draws the
 	 * world once per eye (as a miniature on a virtual table, or from the player
 	 * camera offset by the head pose, per VRView) and copies each result into

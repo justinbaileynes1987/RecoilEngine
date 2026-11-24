@@ -33,6 +33,7 @@
 #include <openxr/openxr_platform.h>
 
 #include "Rendering/VR/VRInput.h"
+#include "Rendering/VR/VRPointer.h"
 
 // after the OpenXR headers: Camera.h defines a `camera` macro that would
 // clash with OpenXR struct members of the same name
@@ -59,6 +60,8 @@ CONFIG(int, VRDebugCapture).defaultValue(0).minimumValue(0).description("Zero-K 
 CONFIG(float, VRIconSwitchAngle).defaultValue(0.5f).minimumValue(0.0f).description("Zero-K VR: units whose radius looks smaller than this many degrees from the eye are drawn as icons in the stereo view. 0 always draws models.");
 CONFIG(float, VRIconSize).defaultValue(0.9f).minimumValue(0.05f).description("Zero-K VR: apparent width in degrees of unit icons in the stereo view (before the icon's own size multiplier).");
 CONFIG(bool, VRPanel).defaultValue(true).description("Zero-K VR: show the desktop frame (with the UI) as a floating panel. Turn off to see only the stereo view.");
+CONFIG(bool, VRPointer).defaultValue(true).description("Zero-K VR (table view): use the controller pointer as the mouse (trigger = left click, A/X = right click). The desktop camera is held over the whole map while VR runs, so every point the pointer reaches is on screen.");
+CONFIG(float, VRPointerMargin).defaultValue(1.6f).minimumValue(1.0f).description("Zero-K VR (table view, pointer on): how much room the desktop view leaves around the map, as a multiple of the map size, so pointer clicks stay clear of the UI at the screen edges.");
 CONFIG(float, VRMirrorWidth).defaultValue(1.6f).minimumValue(0.1f).description("Zero-K VR: width in metres of the desktop panel (UI).");
 
 
@@ -113,6 +116,40 @@ namespace {
 		float yaw = 0.0f;
 		float size = 1.2f;
 	};
+
+	// OpenXR LOCAL space (metres; +x right, +y up, -z forward) to world space
+	// (elmos): world = origin + axes(xr - xrOrigin) * scale
+	struct XrToWorld {
+		float3 origin;
+		float3 xrOrigin;
+		float3 axisX; // world direction of XR +x
+		float3 axisZ; // world direction of XR +z (towards the player)
+		float scale = 1.0f;
+
+		float3 Dir(const XrVector3f& v) const { return (axisX * v.x) + (UpVector * v.y) + (axisZ * v.z); }
+		float3 Pos(const XrVector3f& p) const { return origin + Dir({p.x - xrOrigin.x, p.y - xrOrigin.y, p.z - xrOrigin.z}) * scale; }
+	};
+
+	// the whole map as a miniature on the table: map north points away from
+	// the player (at yaw 0), sea level is the table top;
+	// XR = table.center + RotY(table.yaw, map-local)
+	XrToWorld TableMapping(const TablePose& tp)
+	{
+		const float mapSizeX = static_cast<float>(mapDims.mapx * SQUARE_SIZE);
+		const float mapSizeZ = static_cast<float>(mapDims.mapy * SQUARE_SIZE);
+		const float c = std::cos(tp.yaw);
+		const float s = std::sin(tp.yaw);
+
+		XrToWorld m;
+		m.scale = std::max(mapSizeX, mapSizeZ) / tp.size;
+		m.origin = float3(mapSizeX * 0.5f, 0.0f, mapSizeZ * 0.5f);
+		m.xrOrigin = tp.center;
+		m.axisX = float3(c, 0.0f, s);  // RotY(-yaw) applied to XR +x
+		m.axisZ = float3(-s, 0.0f, c); // RotY(-yaw) applied to XR +z
+		return m;
+	}
+
+	constexpr float POINTER_LENGTH = 5.0f; // metres
 
 	constexpr float MIN_TABLE_SIZE = 0.2f;   // metres
 	constexpr float MAX_TABLE_SIZE = 200.0f; // metres; large enough to stand inside a base
@@ -176,6 +213,18 @@ struct CVRManager::Impl
 
 	void UpdateTable();
 	void SaveTable() const;
+
+	// controller pointer as the mouse (table view, in-game)
+	bool pointerEnabled = true;
+	float pointerMargin = 1.6f;
+	int pointerHand = 1;           // hand that drives the pointer; the last one to click
+	bool pointerButtons[CVRInput::NUM_HANDS][2] = {}; // [hand][0 = trigger, 1 = command], debounced
+	int pointerHit = 0;            // this frame: 0 nothing, 1 world, 2 panel
+	float3 pointerHitPos;          // world position of the hit (on the panel: mapped into the world)
+	void UpdatePointer();
+
+	// where the desktop panel floats (LOCAL space): its centre and size in metres
+	void PanelRect(bool behindTable, float3& center, float& width, float& height) const;
 
 	bool Check(XrResult result, const char* what) const;
 
@@ -718,6 +767,100 @@ void CVRManager::Impl::SaveTable() const
 }
 
 
+void CVRManager::Impl::PanelRect(bool behindTable, float3& center, float& width, float& height) const
+{
+	const float aspect = (mirror.sizeX > 0) ? static_cast<float>(mirror.sizeY) / static_cast<float>(mirror.sizeX) : 0.5625f;
+
+	width = mirrorWidth;
+	height = mirrorWidth * aspect;
+
+	if (behindTable) {
+		// in-game: a screen on the war-room wall behind the table, its bottom
+		// edge at eye level so the table below stays in clear view
+		const float distance = tableDistance + tableSize * 0.5f + 0.3f;
+		center = float3(0.0f, height * 0.5f, -std::max(distance, mirrorDistance));
+	} else {
+		center = float3(0.0f, 0.0f, -mirrorDistance);
+	}
+}
+
+
+void CVRManager::Impl::UpdatePointer()
+{
+	pointerHit = 0;
+
+	// debounce the buttons; the hand that clicks last drives the pointer
+	int pressedHand = -1;
+	for (int h = 0; h < CVRInput::NUM_HANDS; ++h) {
+		const VRHandState& hand = input.Hand(h);
+		bool* b = pointerButtons[h];
+
+		const bool trigger = hand.trigger > (b[0] ? 0.4f : 0.6f);
+		if ((trigger && !b[0]) || (hand.command && !b[1]))
+			pressedHand = h;
+
+		b[0] = trigger;
+		b[1] = hand.command;
+	}
+
+	const bool activeHeld = pointerButtons[pointerHand][0] || pointerButtons[pointerHand][1];
+	if (pressedHand >= 0 && pressedHand != pointerHand && !activeHeld) {
+		// switching hands: let go of anything the old hand held first
+		VRPointer::Release();
+		pointerHand = pressedHand;
+	}
+
+	const VRHandState& hand = input.Hand(pointerHand);
+	VRPointer::Input in;
+	in.left = pointerButtons[pointerHand][0];
+	in.right = pointerButtons[pointerHand][1];
+
+	const XrToWorld m = TableMapping(table);
+	float panelT = -1.0f;
+	XrVector3f panelHitXR = {};
+
+	if (hand.aimValid) {
+		const XrVector3f dirXR = Rotate(hand.aim.orientation, {0.0f, 0.0f, -1.0f});
+
+		in.rayValid = true;
+		in.from = m.Pos(hand.aim.position);
+		in.dir = m.Dir(dirXR).SafeNormalize();
+		in.length = POINTER_LENGTH * m.scale;
+
+		// the panel faces the player (+z); a hit on it wins over the world
+		if (showPanel && dirXR.z < -1e-4f && globalRendering->winSizeX > 0 && globalRendering->winSizeY > 0) {
+			float3 center;
+			float width = 0.0f;
+			float height = 0.0f;
+			PanelRect(true, center, width, height);
+
+			const XrVector3f& p = hand.aim.position;
+			const float t = (center.z - p.z) / dirXR.z;
+			const float u = (p.x + dirXR.x * t - center.x) / width + 0.5f;
+			const float v = (p.y + dirXR.y * t - center.y) / height + 0.5f;
+
+			if (t > 0.0f && u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f) {
+				in.onPanel = true;
+				in.panelX = std::min(static_cast<int>(u * globalRendering->winSizeX), globalRendering->winSizeX - 1);
+				in.panelY = std::min(static_cast<int>((1.0f - v) * globalRendering->winSizeY), globalRendering->winSizeY - 1);
+				panelT = t;
+				panelHitXR = {p.x + dirXR.x * t, p.y + dirXR.y * t, p.z + dirXR.z * t};
+			}
+		}
+	}
+
+	const VRPointer::Result result = VRPointer::Update(in);
+
+	if (in.onPanel && panelT > 0.0f) {
+		pointerHit = 2;
+		pointerHitPos = m.Pos(panelHitXR);
+	} else if (result.worldHit) {
+		pointerHit = 1;
+		pointerHitPos = result.pos;
+	}
+}
+
+
 void CVRManager::Impl::SubmitFrame(bool haveFrame)
 {
 	XrCompositionLayerProjectionView projViews[NUM_EYES];
@@ -752,19 +895,10 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 		panel.subImage.imageRect.extent = {mirror.sizeX, mirror.sizeY};
 		panel.subImage.imageArrayIndex = 0;
 
-		const float aspect = static_cast<float>(mirror.sizeY) / static_cast<float>(mirror.sizeX);
-
+		float3 center;
+		PanelRect(eyesDrawn && tableView, center, panel.size.width, panel.size.height);
 		panel.pose.orientation.w = 1.0f;
-		panel.size = {mirrorWidth, mirrorWidth * aspect};
-
-		if (eyesDrawn && tableView) {
-			// in-game: a screen on the war-room wall behind the table, its bottom
-			// edge at eye level so the table below stays in clear view
-			const float behindTable = tableDistance + tableSize * 0.5f + 0.3f;
-			panel.pose.position = {0.0f, panel.size.height * 0.5f, -std::max(behindTable, mirrorDistance)};
-		} else {
-			panel.pose.position = {0.0f, 0.0f, -mirrorDistance};
-		}
+		panel.pose.position = {center.x, center.y, center.z};
 
 		layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&panel);
 	}
@@ -809,6 +943,8 @@ void CVRManager::Init()
 	impl->tableView = (configHandler->GetString("VRView") != "camera");
 	impl->debugCaptureFrame = configHandler->GetInt("VRDebugCapture");
 	impl->showPanel = configHandler->GetBool("VRPanel");
+	impl->pointerEnabled = configHandler->GetBool("VRPointer");
+	impl->pointerMargin = configHandler->GetFloat("VRPointerMargin");
 	VRState::iconSwitchTan = std::tan(configHandler->GetFloat("VRIconSwitchAngle") * 0.0174533f);
 	VRState::iconHalfSizeTan = std::tan(configHandler->GetFloat("VRIconSize") * 0.5f * 0.0174533f);
 	impl->tableSize = configHandler->GetFloat("VRTableSize");
@@ -833,6 +969,7 @@ void CVRManager::Init()
 
 void CVRManager::Kill()
 {
+	VRPointer::Release();
 	impl->SaveTable();
 	impl->Destroy();
 }
@@ -869,6 +1006,23 @@ void CVRManager::BeginFrame()
 		impl->input.Update(impl->session, impl->localSpace, impl->frameState.predictedDisplayTime);
 		impl->UpdateTable();
 	}
+}
+
+
+void CVRManager::UpdateDesktop()
+{
+	Impl& m = *impl;
+
+	if (!m.running || !m.tableView || !m.pointerEnabled || !VRPointer::InGame()) {
+		m.pointerHit = 0;
+		VRPointer::Release();
+		return;
+	}
+
+	VRPointer::LockDesktopCamera(m.pointerMargin);
+
+	if (m.inputReady)
+		m.UpdatePointer();
 }
 
 
@@ -1049,22 +1203,13 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 	float scale = 1.0f;
 
 	if (impl->tableView) {
-		// the whole map as a miniature on a table in front of the player:
-		// map north points away from the player, sea level is the table top
-		const float mapSizeX = static_cast<float>(mapDims.mapx * SQUARE_SIZE);
-		const float mapSizeZ = static_cast<float>(mapDims.mapy * SQUARE_SIZE);
-
-		// placement comes from impl->table (moved, turned and zoomed by the
-		// controllers): XR = table.center + RotY(table.yaw, map-local)
-		const TablePose& tp = impl->table;
-		const float c = std::cos(tp.yaw);
-		const float s = std::sin(tp.yaw);
-
-		scale = std::max(mapSizeX, mapSizeZ) / tp.size;
-		origin = float3(mapSizeX * 0.5f, 0.0f, mapSizeZ * 0.5f);
-		xrOrigin = tp.center;
-		axisX = float3(c, 0.0f, s);  // RotY(-yaw) applied to XR +x
-		axisZ = float3(-s, 0.0f, c); // RotY(-yaw) applied to XR +z
+		// placement comes from impl->table (moved, turned and zoomed by the controllers)
+		const XrToWorld m = TableMapping(impl->table);
+		scale = m.scale;
+		origin = m.origin;
+		xrOrigin = m.xrOrigin;
+		axisX = m.axisX;
+		axisZ = m.axisZ;
 	} else {
 		// anchored at the player camera, keeping only its heading so the
 		// horizon stays level
@@ -1108,7 +1253,7 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 
 			if ((hv.aimValid = hand.aimValid)) {
 				const float3 dir = ToWorldDir(Rotate(hand.aim.orientation, {0.0f, 0.0f, -1.0f})).SafeNormalize();
-				const float maxLen = 5.0f * scale; // 5 m of pointer
+				const float maxLen = POINTER_LENGTH * scale;
 
 				hv.rayFrom = ToWorldPos(hand.aim.position);
 				hv.triggered = (hand.trigger > 0.5f);
@@ -1119,6 +1264,13 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 
 				hv.rayHit = (hitDist >= 0.0f);
 				hv.rayTo = hv.rayFrom + dir * (hv.rayHit ? hitDist : (0.4f * scale));
+
+				// the mouse pointer: end the ray where the click goes (a unit, the
+				// ground or the desktop panel)
+				if (h == impl->pointerHand && impl->pointerHit != 0) {
+					hv.rayHit = (impl->pointerHit == 1);
+					hv.rayTo = impl->pointerHitPos;
+				}
 			}
 		}
 	}

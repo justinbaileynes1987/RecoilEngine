@@ -92,6 +92,7 @@ if (ENABLE_OPENXR)
 	target_sources(engine-legacy PRIVATE
 		"${ENGINE_SRC_ROOT_DIR}/Rendering/VR/VRManager.cpp"
 		"${ENGINE_SRC_ROOT_DIR}/Rendering/VR/VRInput.cpp"
+		"${ENGINE_SRC_ROOT_DIR}/Rendering/VR/VRPointer.cpp"
 	)
 	target_compile_definitions(engine-legacy PRIVATE ENABLE_OPENXR)
 	target_compile_definitions(Game PRIVATE ENABLE_OPENXR)

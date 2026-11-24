@@ -15,6 +15,7 @@ struct VRHandState {
 	XrPosef aim  = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
 	float squeeze = 0.0f;        // grip button, 0..1
 	float trigger = 0.0f;        // 0..1
+	bool command = false;        // primary face button (A / X), or the trackpad click
 	XrVector2f thumbstick = {0.0f, 0.0f};
 };
 
@@ -43,6 +44,7 @@ private:
 	XrAction squeezeAction = XR_NULL_HANDLE;
 	XrAction triggerAction = XR_NULL_HANDLE;
 	XrAction thumbstickAction = XR_NULL_HANDLE;
+	XrAction commandAction = XR_NULL_HANDLE;
 
 	XrPath handPaths[NUM_HANDS] = {XR_NULL_PATH, XR_NULL_PATH};
 	XrSpace gripSpaces[NUM_HANDS] = {XR_NULL_HANDLE, XR_NULL_HANDLE};

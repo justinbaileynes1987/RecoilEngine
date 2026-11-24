@@ -1363,6 +1363,11 @@ bool CGame::UpdateUnsynced(const spring_time currentTime)
 	// set camera
 	camHandler->UpdateController(playerHandler.Player(gu->myPlayerNum), gu->fpsMode);
 
+	#ifdef ENABLE_OPENXR
+	// table view: overview desktop camera, controller pointer as the mouse
+	CVRManager::GetInstance().UpdateDesktop();
+	#endif
+
 	lineDrawer.UpdateLineStipple();
 
 	icon::iconHandler.Update();

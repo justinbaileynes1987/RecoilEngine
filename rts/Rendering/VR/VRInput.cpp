@@ -58,19 +58,23 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 	    !MakeAction(aimPoseAction, XR_ACTION_TYPE_POSE_INPUT, "aim_pose", "Pointer pose") ||
 	    !MakeAction(squeezeAction, XR_ACTION_TYPE_FLOAT_INPUT, "grab", "Grab the table") ||
 	    !MakeAction(triggerAction, XR_ACTION_TYPE_FLOAT_INPUT, "select", "Select / command") ||
-	    !MakeAction(thumbstickAction, XR_ACTION_TYPE_VECTOR2F_INPUT, "thumbstick", "Thumbstick")) {
+	    !MakeAction(thumbstickAction, XR_ACTION_TYPE_VECTOR2F_INPUT, "thumbstick", "Thumbstick") ||
+	    !MakeAction(commandAction, XR_ACTION_TYPE_BOOLEAN_INPUT, "command", "Command (right click)")) {
 		Destroy();
 		return false;
 	}
 
 	// suggested bindings; the runtime picks the profile that matches the
 	// controllers in use (SteamVR can also remap them in its binding UI)
-	struct Binding { XrAction action; const char* input; };
+	// hands: bit 0 = left, bit 1 = right
+	struct Binding { XrAction action; const char* input; int hands = 3; };
 	const auto Suggest = [&](const char* profile, std::initializer_list<Binding> bindings) {
 		std::vector<XrActionSuggestedBinding> suggested;
-		for (const char* hand: {"/user/hand/left", "/user/hand/right"}) {
+		const char* handNames[NUM_HANDS] = {"/user/hand/left", "/user/hand/right"};
+		for (int h = 0; h < NUM_HANDS; ++h) {
 			for (const Binding& b: bindings) {
-				suggested.push_back({b.action, ToPath(instance, std::string(hand) + b.input)});
+				if ((b.hands >> h) & 1)
+					suggested.push_back({b.action, ToPath(instance, std::string(handNames[h]) + b.input)});
 			}
 		}
 
@@ -88,6 +92,7 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 		{gripPoseAction, "/input/grip/pose"},
 		{aimPoseAction, "/input/aim/pose"},
 		{triggerAction, "/input/select/click"},
+		{commandAction, "/input/menu/click"},
 	});
 	Suggest("/interaction_profiles/oculus/touch_controller", {
 		{gripPoseAction, "/input/grip/pose"},
@@ -95,6 +100,8 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 		{squeezeAction, "/input/squeeze/value"},
 		{triggerAction, "/input/trigger/value"},
 		{thumbstickAction, "/input/thumbstick"},
+		{commandAction, "/input/x/click", 1},
+		{commandAction, "/input/a/click", 2},
 	});
 	Suggest("/interaction_profiles/valve/index_controller", {
 		{gripPoseAction, "/input/grip/pose"},
@@ -102,6 +109,7 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 		{squeezeAction, "/input/squeeze/value"},
 		{triggerAction, "/input/trigger/value"},
 		{thumbstickAction, "/input/thumbstick"},
+		{commandAction, "/input/a/click"},
 	});
 	Suggest("/interaction_profiles/htc/vive_controller", {
 		{gripPoseAction, "/input/grip/pose"},
@@ -109,6 +117,7 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 		{squeezeAction, "/input/squeeze/click"},
 		{triggerAction, "/input/trigger/value"},
 		{thumbstickAction, "/input/trackpad"},
+		{commandAction, "/input/trackpad/click"},
 	});
 	Suggest("/interaction_profiles/microsoft/motion_controller", {
 		{gripPoseAction, "/input/grip/pose"},
@@ -116,6 +125,7 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 		{squeezeAction, "/input/squeeze/click"},
 		{triggerAction, "/input/trigger/value"},
 		{thumbstickAction, "/input/thumbstick"},
+		{commandAction, "/input/trackpad/click"},
 	});
 
 	for (int h = 0; h < NUM_HANDS; ++h) {
@@ -173,6 +183,7 @@ void CVRInput::Destroy()
 	squeezeAction = XR_NULL_HANDLE;
 	triggerAction = XR_NULL_HANDLE;
 	thumbstickAction = XR_NULL_HANDLE;
+	commandAction = XR_NULL_HANDLE;
 }
 
 
@@ -218,6 +229,10 @@ void CVRInput::Update(XrSession session, XrSpace baseSpace, XrTime time)
 		XrActionStateVector2f vecState = {XR_TYPE_ACTION_STATE_VECTOR2F};
 		getInfo.action = thumbstickAction;
 		hand.thumbstick = (XR_SUCCEEDED(xrGetActionStateVector2f(session, &getInfo, &vecState)) && vecState.isActive) ? vecState.currentState : XrVector2f{0.0f, 0.0f};
+
+		XrActionStateBoolean boolState = {XR_TYPE_ACTION_STATE_BOOLEAN};
+		getInfo.action = commandAction;
+		hand.command = XR_SUCCEEDED(xrGetActionStateBoolean(session, &getInfo, &boolState)) && boolState.isActive && boolState.currentState;
 
 		const auto LocatePose = [&](XrAction action, XrSpace space, XrPosef& pose) {
 			XrActionStatePose poseState = {XR_TYPE_ACTION_STATE_POSE};
