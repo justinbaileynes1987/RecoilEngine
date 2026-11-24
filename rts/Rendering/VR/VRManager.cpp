@@ -51,6 +51,8 @@ CONFIG(float, VRTableHeight).defaultValue(-0.5f).description("Zero-K VR (table v
 CONFIG(float, VRWorldScale).defaultValue(300.0f).minimumValue(1.0f).description("Zero-K VR (camera view): game distance units (elmos) per real-world metre of head movement.");
 CONFIG(float, VRMirrorDistance).defaultValue(1.5f).minimumValue(0.3f).description("Zero-K VR: distance in metres from the starting head position to the desktop panel (UI). In-game with the table view, the panel stands behind the table instead.");
 CONFIG(int, VRDebugCapture).defaultValue(0).minimumValue(0).description("Zero-K VR: if N > 0, save both eye images (vr-eye-0.png, vr-eye-1.png) to the write dir on the Nth frame that draws the eyes, and log the eye positions.");
+CONFIG(float, VRIconSwitchAngle).defaultValue(0.5f).minimumValue(0.0f).description("Zero-K VR: units whose radius looks smaller than this many degrees from the eye are drawn as icons in the stereo view. 0 always draws models.");
+CONFIG(float, VRIconSize).defaultValue(0.9f).minimumValue(0.05f).description("Zero-K VR: apparent width in degrees of unit icons in the stereo view (before the icon's own size multiplier).");
 CONFIG(bool, VRPanel).defaultValue(true).description("Zero-K VR: show the desktop frame (with the UI) as a floating panel. Turn off to see only the stereo view.");
 CONFIG(float, VRMirrorWidth).defaultValue(1.6f).minimumValue(0.1f).description("Zero-K VR: width in metres of the desktop panel (UI).");
 
@@ -658,6 +660,8 @@ void CVRManager::Init()
 	impl->tableView = (configHandler->GetString("VRView") != "camera");
 	impl->debugCaptureFrame = configHandler->GetInt("VRDebugCapture");
 	impl->showPanel = configHandler->GetBool("VRPanel");
+	VRState::iconSwitchTan = std::tan(configHandler->GetFloat("VRIconSwitchAngle") * 0.0174533f);
+	VRState::iconHalfSizeTan = std::tan(configHandler->GetFloat("VRIconSize") * 0.5f * 0.0174533f);
 	impl->tableSize = configHandler->GetFloat("VRTableSize");
 	impl->tableDistance = configHandler->GetFloat("VRTableDistance");
 	impl->tableHeight = configHandler->GetFloat("VRTableHeight");

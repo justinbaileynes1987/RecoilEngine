@@ -476,7 +476,8 @@ void CWorldDrawer::DrawMiscObjects() const
 	// either draw from here, or make {Dyn,Bump}Water use blending
 	// pro: icons are drawn only once per frame, not every pass
 	// con: looks somewhat worse for underwater / obscured icons
-	if (!CUnitDrawer::UseScreenIcons())
+	// Zero-K VR: screen-space icons only reach the desktop, so the eye views draw 3D icons
+	if (!CUnitDrawer::UseScreenIcons() || VRState::eyePass)
 		unitDrawer->DrawUnitIcons();
 
 	lineDrawer.DrawAll();

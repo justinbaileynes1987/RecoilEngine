@@ -56,6 +56,7 @@
 #include "System/Threading/ThreadPool.h"
 
 #include "System/Misc/TracyDefs.h"
+#include "Rendering/VR/VRState.h"
 
 CONFIG(int, UnitIconDist).defaultValue(200).headlessValue(0);
 CONFIG(float, UnitIconScaleUI).defaultValue(1.0f).minimumValue(0.1f).maximumValue(10.0f);
@@ -521,6 +522,10 @@ float CUnitDrawerGLSL::DrawUnitIcon(TypedRenderBuffer<VA_TYPE_TC3>& rb, size_t i
 	const float dist = std::min(8000.0f, fastmath::sqrt_builtin(camera->GetPos().SqDistance(pos)));
 	const float iconScaleDist = 0.4f * fastmath::sqrt_builtin(dist); // makes far icons bigger
 	float scale = iconData.GetSize() * iconScaleDist;
+
+	// Zero-K VR: constant apparent size in the eye views
+	if (VRState::eyePass)
+		scale = iconData.GetSize() * fastmath::sqrt_builtin(camera->GetPos().SqDistance(pos)) * VRState::iconHalfSizeTan;
 
 	if (iconData.GetRadiusAdjust() && iconIdx != icon::iconHandler.GetDefaultIconIdx())
 		scale *= (unitRadius / iconData.GetRadiusScale());
