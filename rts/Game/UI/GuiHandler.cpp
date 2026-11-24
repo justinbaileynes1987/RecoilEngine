@@ -30,6 +30,7 @@
 #include "Rendering/Map/InfoTexture/IInfoTextureHandler.h"
 #include "Rendering/Textures/Bitmap.h"
 #include "Rendering/Textures/NamedTextures.h"
+#include "Rendering/VR/VRState.h"
 #include "Sim/Features/Feature.h"
 #include "Sim/Misc/LosHandler.h"
 #include "Sim/Units/CommandAI/CommandAI.h"
@@ -3570,7 +3571,8 @@ void CGuiHandler::DrawMapStuff(bool onMiniMap)
 			DrawMiniMapMarker(tracePos);
 		}
 	} else {
-		tracePos = camera->GetPos();
+		// Zero-K VR: mouse->dir belongs to the desktop camera, also while an eye is drawn
+		tracePos = VRState::ScreenCamera(camera)->GetPos();
 		traceDir = mouse->dir;
 	}
 

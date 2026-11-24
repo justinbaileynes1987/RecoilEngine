@@ -1321,6 +1321,12 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 	if (impl->inputReady)
 		VRPointer::SelectionFootprint(selectionOutline);
 
+	// keep the desktop camera for screen<->world queries made while the eyes
+	// are drawn (the mouse, Spring.TraceScreenRay, area-command previews)
+	static CCamera desktopCamera;
+	desktopCamera = *cam;
+	VRState::desktopCamera = &desktopCamera;
+
 	bool ok = true;
 
 	// the miniature has no fog and no sky: push fog past the far plane and
@@ -1415,6 +1421,7 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 
 	// restore the desktop camera's visibility and params for the desktop draw
 	VRState::eyePass = false;
+	VRState::desktopCamera = nullptr;
 	updateForCamera();
 	UniformConstants::GetInstance().UpdateMatrices();
 	UniformConstants::GetInstance().UpdateParams();

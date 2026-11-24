@@ -24,6 +24,7 @@
 #include "Map/ReadMap.h"
 #include "System/Log/ILog.h"
 #include "System/SafeUtil.h"
+#include "Rendering/VR/VRState.h"
 #include "SDL2/SDL_mouse.h"
 
 CR_BIND(UniformMatricesBuffer, )
@@ -269,11 +270,14 @@ void UniformConstants::UpdateParamsImpl(UniformParamsBuffer* updateBuffer)
 		const CUnit* unit = nullptr;
 		const CFeature* feature = nullptr;
 
-		const float rawRange = camPlayer->GetFarPlaneDist() * 1.4f;
+		// Zero-K VR: the mouse is on the desktop window, also while an eye is drawn
+		const CCamera* screenCam = VRState::ScreenCamera(camPlayer);
+
+		const float rawRange = screenCam->GetFarPlaneDist() * 1.4f;
 		const float badRange = rawRange - 300.0f;
 
-		const float3 camPos = camPlayer->GetPos();
-		const float3 pxlDir = camPlayer->CalcPixelDir(wx, wy);
+		const float3 camPos = screenCam->GetPos();
+		const float3 pxlDir = screenCam->CalcPixelDir(wx, wy);
 
 		// trace for player's allyteam
 		const float traceDist = TraceRay::GuiTraceRay(camPos, pxlDir, rawRange, nullptr, unit, feature, true, false, true);

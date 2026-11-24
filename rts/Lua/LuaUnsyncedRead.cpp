@@ -46,6 +46,7 @@
 #include "Rendering/Units/UnitDrawer.h"
 #include "Rendering/Features/FeatureDrawer.h"
 #include "Rendering/IconHandler.h"
+#include "Rendering/VR/VRState.h"
 #include "Sim/Features/Feature.h"
 #include "Sim/Features/FeatureDef.h"
 #include "Sim/Features/FeatureHandler.h"
@@ -3159,7 +3160,7 @@ int LuaUnsyncedRead::WorldToScreenCoords(lua_State* L)
 	const float3 worldPos(luaL_checkfloat(L, 1),
 	                      luaL_checkfloat(L, 2),
 	                      luaL_checkfloat(L, 3));
-	const float3 vpPos = camera->CalcViewPortCoordinates(worldPos);
+	const float3 vpPos = VRState::ScreenCamera(camera)->CalcViewPortCoordinates(worldPos);
 	lua_pushnumber(L, vpPos.x);
 	lua_pushnumber(L, vpPos.y);
 	lua_pushnumber(L, vpPos.z);
@@ -3244,11 +3245,14 @@ int LuaUnsyncedRead::TraceScreenRay(lua_State* L)
 	const CUnit* unit = nullptr;
 	const CFeature* feature = nullptr;
 
-	const float rawRange = camera->GetFarPlaneDist() * 1.4f;
+	// Zero-K VR: screen pixels are always the desktop window's
+	const CCamera* screenCam = VRState::ScreenCamera(camera);
+
+	const float rawRange = screenCam->GetFarPlaneDist() * 1.4f;
 	const float badRange = rawRange - 300.0f;
 
-	const float3 camPos = camera->GetPos();
-	const float3 pxlDir = camera->CalcPixelDir(wx, wy);
+	const float3 camPos = screenCam->GetPos();
+	const float3 pxlDir = screenCam->CalcPixelDir(wx, wy);
 
 	// trace for player's allyteam
 	const float traceDist = TraceRay::GuiTraceRay(camPos, pxlDir, rawRange, nullptr, unit, feature, true, onlyCoords, ignoreWater);
@@ -3306,7 +3310,7 @@ int LuaUnsyncedRead::GetPixelDir(lua_State* L)
 {
 	const int x = luaL_checkint(L, 1);
 	const int y = luaL_checkint(L, 2);
-	const float3 dir = camera->CalcPixelDir(x, y);
+	const float3 dir = VRState::ScreenCamera(camera)->CalcPixelDir(x, y);
 	lua_pushnumber(L, dir.x);
 	lua_pushnumber(L, dir.y);
 	lua_pushnumber(L, dir.z);
