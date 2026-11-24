@@ -78,6 +78,8 @@ namespace VRState {
 	struct UIPanelRequest {
 		std::string name;
 		int anchor = UI_ANCHOR_BAR; // bar: on the table's far edge; palette: on the off hand
+		float widthM = 0.0f;        // physical width in metres; 0 = the anchor's default metres per pixel
+		bool canvas = false;        // source "vr": a rectangle of the VR UI canvas (RmlUi "vr_" contexts, see VRRml.h), not the desktop frame
 		int x = 0;
 		int y = 0;
 		int w = 0;

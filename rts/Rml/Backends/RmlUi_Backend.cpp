@@ -98,6 +98,7 @@ public:
 	VFSFileInterface file_interface;
 
 	std::vector<Rml::Context*> contexts;
+	std::vector<Rml::Context*> vr_contexts; // Zero-K VR: "vr_" contexts, kept off the desktop (VRRml.h)
 	std::unordered_set<Rml::Context*> contexts_to_remove;
 
 	Rml::Context* debug_host_context = nullptr;
@@ -314,6 +315,12 @@ CInputReceiver* RmlGui::GetInputReceiver()
 void RmlGui::OnContextCreate(Rml::Context* context)
 {
 	context->SetDimensions({state->winX, state->winY});
+#ifdef ENABLE_OPENXR
+	if (context->GetName().starts_with("vr_")) {
+		state->vr_contexts.push_back(context);
+		return;
+	}
+#endif
 	if likely(state->debug_host_context || context->GetName() != RML_DEBUG_HOST_CONTEXT_NAME) {
 		state->contexts.push_back(context);
 	} else {
@@ -323,6 +330,12 @@ void RmlGui::OnContextCreate(Rml::Context* context)
 
 void RmlGui::OnContextDestroy(Rml::Context* context)
 {
+#ifdef ENABLE_OPENXR
+	if (const auto it = std::ranges::find(state->vr_contexts, context); it != state->vr_contexts.end()) {
+		state->vr_contexts.erase(it);
+		return;
+	}
+#endif
 	state->contexts.erase(std::ranges::find(state->contexts, context));
 }
 
@@ -371,6 +384,9 @@ void RmlGui::Update()
 	}
 
 	for (const auto& context : state->contexts) {
+		context->Update();
+	}
+	for (const auto& context : state->vr_contexts) {
 		context->Update();
 	}
 
@@ -607,3 +623,71 @@ lua_State* RmlGui::GetLuaState()
 
     return state->ls;
 }
+
+#ifdef ENABLE_OPENXR
+// Zero-K VR: the headset's own contexts (see Rendering/VR/VRRml.h)
+#include "Rendering/VR/VRRml.h"
+
+bool VRRml::HaveContexts()
+{
+	return RmlInitialized() && !state->vr_contexts.empty();
+}
+
+bool VRRml::Render(unsigned int framebuffer)
+{
+#ifndef HEADLESS
+	if (!HaveContexts())
+		return false;
+
+	for (const auto& context : state->vr_contexts) {
+		if (context->GetDimensions() != Rml::Vector2i(state->winX, state->winY))
+			context->SetDimensions({state->winX, state->winY});
+	}
+
+	state->render_interface.SetOutputFramebuffer(framebuffer);
+	RmlGui::BeginFrame();
+	for (auto& context: std::ranges::reverse_view(state->vr_contexts)) {
+		context->Render();
+	}
+	RmlGui::PresentFrame();
+	state->render_interface.SetOutputFramebuffer(0);
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool VRRml::PointerMove(int x, int y)
+{
+	if (!HaveContexts())
+		return false;
+
+	bool handled = false;
+	for (const auto& context : state->vr_contexts) {
+		handled |= !context->ProcessMouseMove(x, y, 0);
+	}
+	return handled;
+}
+
+bool VRRml::PointerButton(int button, bool down)
+{
+	if (!HaveContexts())
+		return false;
+
+	bool handled = false;
+	for (const auto& context : state->vr_contexts) {
+		handled |= down ? !context->ProcessMouseButtonDown(button, 0) : !context->ProcessMouseButtonUp(button, 0);
+	}
+	return handled;
+}
+
+void VRRml::PointerLeave()
+{
+	if (!HaveContexts())
+		return;
+
+	for (const auto& context : state->vr_contexts) {
+		context->ProcessMouseLeave();
+	}
+}
+#endif

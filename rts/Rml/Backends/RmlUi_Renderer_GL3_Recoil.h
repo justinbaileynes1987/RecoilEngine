@@ -62,6 +62,8 @@ public:
 
 	// The viewport should be updated whenever the window size changes.
 	void SetViewport(int viewport_width, int viewport_height, int viewport_offset_x = 0, int viewport_offset_y = 0);
+	// Zero-K VR: where EndFrame draws the finished frame (0 = the back buffer)
+	void SetOutputFramebuffer(unsigned int framebuffer) { output_framebuffer = framebuffer; }
 
 	// Sets up OpenGL states for taking rendering commands from RmlUi.
 	void BeginFrame();
@@ -138,6 +140,7 @@ private:
 	int viewport_height = 0;
 	int viewport_offset_x = 0;
 	int viewport_offset_y = 0;
+	unsigned int output_framebuffer = 0; // Zero-K VR
 
 	Rml::CompiledGeometryHandle fullscreen_quad_geometry = {};
 

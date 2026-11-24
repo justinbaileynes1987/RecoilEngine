@@ -34,6 +34,7 @@
 
 #include "Rendering/VR/VRInput.h"
 #include "Rendering/VR/VRPointer.h"
+#include "Rendering/VR/VRRml.h"
 
 // after the OpenXR headers: Camera.h defines a `camera` macro that would
 // clash with OpenXR struct members of the same name
@@ -292,6 +293,8 @@ struct CVRManager::Impl
 	struct UIPanelLayer {
 		std::string name;
 		int anchor = VRState::UI_ANCHOR_BAR;
+		bool canvas = false;             // from the VR UI canvas (RmlUi "vr_" contexts), not the desktop frame
+		float metresPerPixel = 0.0f;     // 0: the anchor's default scale (VRBarScale / VRPaletteScale)
 		int x = 0, y = 0, w = 0, h = 0; // window pixels, top-left origin
 		ColorSwapchain sc;
 		bool visible = false;           // this frame
@@ -302,12 +305,26 @@ struct CVRManager::Impl
 	bool uiPanelsEnabled = true;  // VRUIPanels
 	bool tvShown = false;         // the big desktop panel, while UI panels exist (thumbstick toggle)
 	bool paletteShown = false;    // the off-hand palette faces the head (with hysteresis)
+	// VR UI (RmlUi) pointer state: buttons held on the UI, hovering it, or a
+	// button held in the world (a drag), so a press keeps its target until release
+	bool uiButtons[2] = {false, false};
+	bool uiHover = false;
+	bool worldHeld = false;
+	// the VR UI canvas: the "vr_" RmlUi contexts drawn offscreen, window-sized
+	GLuint canvasFBO = 0;
+	GLuint canvasTex = 0;
+	int canvasSizeX = 0;
+	int canvasSizeY = 0;
+	bool RenderCanvas(int sizeX, int sizeY);
 	float barScale = 0.0007f;
 	float barMaxDistance = 1.6f;
 	float paletteScale = 0.0005f;
 	float paletteTilt = 0.52f;    // radians
 	void SyncUIPanels();
 	void LayoutUIPanels();
+	static float Scale(const UIPanelLayer& layer, float anchorScale) {
+		return (layer.metresPerPixel > 0.0f) ? layer.metresPerPixel : anchorScale;
+	}
 	void HideUIPanels();
 	// whether the big desktop panel shows: always outside the eye views (menus),
 	// in-game when VRPanel is on and either no UI panels exist or it is toggled on
@@ -330,7 +347,7 @@ struct CVRManager::Impl
 	// resolve a rectangle of the back buffer into resolveTex (at 0,0), then
 	// scale a rectangle of resolveTex into a swapchain's next image
 	bool ResolveBackBuffer(int srcX, int srcY, int srcSizeX, int srcSizeY);
-	bool BlitResolvedTo(ColorSwapchain& sc, int srcX, int srcY, int srcSizeX, int srcSizeY);
+	bool BlitResolvedTo(ColorSwapchain& sc, int srcX, int srcY, int srcSizeX, int srcSizeY, GLuint sourceFBO = 0); // 0: resolveFBO
 	bool CopyBackBufferTo(ColorSwapchain& sc, int srcX, int srcY, int srcSizeX, int srcSizeY) {
 		return ResolveBackBuffer(srcX, srcY, srcSizeX, srcSizeY) && BlitResolvedTo(sc, 0, 0, srcSizeX, srcSizeY);
 	}
@@ -587,6 +604,16 @@ void CVRManager::Impl::Destroy()
 	}
 	resolveSizeX = 0;
 	resolveSizeY = 0;
+	if (canvasFBO != 0) {
+		glDeleteFramebuffers(1, &canvasFBO);
+		canvasFBO = 0;
+	}
+	if (canvasTex != 0) {
+		glDeleteTextures(1, &canvasTex);
+		canvasTex = 0;
+	}
+	canvasSizeX = 0;
+	canvasSizeY = 0;
 
 	for (ColorSwapchain* sc: {&mirror, &eyes[0], &eyes[1]}) {
 		if (sc->handle != XR_NULL_HANDLE)
@@ -780,9 +807,58 @@ bool CVRManager::Impl::ResolveBackBuffer(int srcX, int srcY, int srcSizeX, int s
 }
 
 
-bool CVRManager::Impl::BlitResolvedTo(ColorSwapchain& sc, int srcX, int srcY, int srcSizeX, int srcSizeY)
+// draws the VR UI (RmlUi "vr_" contexts) into the window-sized canvas, cleared
+// to transparent; panels are cut out of it like the desktop ones
+bool CVRManager::Impl::RenderCanvas(int sizeX, int sizeY)
 {
-	if (sc.handle == XR_NULL_HANDLE || resolveFBO == 0)
+	if (sizeX <= 0 || sizeY <= 0 || !VRRml::HaveContexts())
+		return false;
+
+	BlitStateGuard guard;
+
+	if (canvasSizeX != sizeX || canvasSizeY != sizeY) {
+		if (canvasTex == 0)
+			glGenTextures(1, &canvasTex);
+		if (canvasFBO == 0)
+			glGenFramebuffers(1, &canvasFBO);
+
+		GLint prevTex = 0;
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+		glBindTexture(GL_TEXTURE_2D, canvasTex);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sizeX, sizeY, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glBindTexture(GL_TEXTURE_2D, prevTex);
+
+		glBindFramebuffer(GL_FRAMEBUFFER, canvasFBO);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, canvasTex, 0);
+
+		canvasSizeX = sizeX;
+		canvasSizeY = sizeY;
+	}
+
+	GLfloat prevClear[4];
+	GLboolean prevMask[4];
+	glGetFloatv(GL_COLOR_CLEAR_VALUE, prevClear);
+	glGetBooleanv(GL_COLOR_WRITEMASK, prevMask);
+
+	glBindFramebuffer(GL_FRAMEBUFFER, canvasFBO);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	glClearColor(prevClear[0], prevClear[1], prevClear[2], prevClear[3]);
+	glColorMask(prevMask[0], prevMask[1], prevMask[2], prevMask[3]);
+
+	return VRRml::Render(canvasFBO);
+}
+
+
+bool CVRManager::Impl::BlitResolvedTo(ColorSwapchain& sc, int srcX, int srcY, int srcSizeX, int srcSizeY, GLuint sourceFBO)
+{
+	if (sourceFBO == 0)
+		sourceFBO = resolveFBO;
+	if (sc.handle == XR_NULL_HANDLE || sourceFBO == 0)
 		return false;
 
 	uint32_t imageIndex = 0;
@@ -801,7 +877,7 @@ bool CVRManager::Impl::BlitResolvedTo(ColorSwapchain& sc, int srcX, int srcY, in
 		// drop errors raised before this point so the check below is about the copy
 		while (glGetError() != GL_NO_ERROR) {}
 
-		glBindFramebuffer(GL_READ_FRAMEBUFFER, resolveFBO);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, sourceFBO);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, blitFBO);
 		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sc.images[imageIndex].image, 0);
 		glBlitFramebuffer(
@@ -956,10 +1032,12 @@ void CVRManager::Impl::SyncUIPanels()
 
 		layer.name = req.name;
 		layer.anchor = req.anchor;
+		layer.canvas = req.canvas;
 		layer.x = x0;
 		layer.y = y0;
 		layer.w = x1 - x0;
 		layer.h = y1 - y0;
+		layer.metresPerPixel = (req.widthM > 0.0f) ? req.widthM / static_cast<float>(layer.w) : 0.0f;
 
 		summary += " " + layer.name + ((layer.anchor == VRState::UI_ANCHOR_PALETTE) ? "(palette " : "(bar ") + std::to_string(layer.w) + "x" + std::to_string(layer.h) + ")";
 		next.push_back(std::move(layer));
@@ -1012,7 +1090,7 @@ void CVRManager::Impl::LayoutUIPanels()
 		for (const UIPanelLayer& layer: uiLayers) {
 			if (layer.anchor != VRState::UI_ANCHOR_BAR)
 				continue;
-			totalW += layer.w * barScale;
+			totalW += layer.w * Scale(layer, barScale);
 			count++;
 		}
 
@@ -1047,8 +1125,8 @@ void CVRManager::Impl::LayoutUIPanels()
 				if (layer.anchor != VRState::UI_ANCHOR_BAR)
 					continue;
 
-				const float w = layer.w * barScale;
-				const float h = layer.h * barScale;
+				const float w = layer.w * Scale(layer, barScale);
+				const float h = layer.h * Scale(layer, barScale);
 				const float3 c = base + right * (x + w * 0.5f) + up * (h * 0.5f);
 
 				layer.quad.pose.orientation = q;
@@ -1070,7 +1148,7 @@ void CVRManager::Impl::LayoutUIPanels()
 		float totalH = 0.0f;
 		for (const UIPanelLayer& layer: uiLayers) {
 			if (layer.anchor == VRState::UI_ANCHOR_PALETTE)
-				totalH += layer.h * paletteScale;
+				totalH += layer.h * Scale(layer, paletteScale);
 		}
 
 		if (!handFree || totalH <= 0.0f) {
@@ -1101,8 +1179,8 @@ void CVRManager::Impl::LayoutUIPanels()
 			if (layer.anchor != VRState::UI_ANCHOR_PALETTE)
 				continue;
 
-			const float w = layer.w * paletteScale;
-			const float h = layer.h * paletteScale;
+			const float w = layer.w * Scale(layer, paletteScale);
+			const float h = layer.h * Scale(layer, paletteScale);
 			const float3 c = grip + up * (y + h * 0.5f);
 
 			layer.quad.pose.orientation = q;
@@ -1176,6 +1254,7 @@ void CVRManager::Impl::UpdatePointer()
 	const XrToWorld m = TableMapping(table);
 	float panelT = -1.0f;
 	XrVector3f panelHitXR = {};
+	bool onCanvas = false; // the nearest panel hit is a VR UI (canvas) panel
 
 	if (hand.aimValid) {
 		const XrVector3f dirXR = Rotate(hand.aim.orientation, {0.0f, 0.0f, -1.0f});
@@ -1201,12 +1280,13 @@ void CVRManager::Impl::UpdatePointer()
 			const float3 from = ToF3(hand.aim.position);
 			const float3 dir = ToF3(dirXR);
 
-			const auto TryPanel = [&](const PanelQuad& quad, int px, int py, int pw, int ph) {
+			const auto TryPanel = [&](const PanelQuad& quad, int px, int py, int pw, int ph, bool canvas) {
 				float t = 0.0f, u = 0.0f, v = 0.0f;
 				if (!RayQuad(quad, from, dir, t, u, v) || (panelT > 0.0f && t >= panelT))
 					return;
 
-				in.onPanel = true;
+				in.onPanel = !canvas;
+				onCanvas = canvas;
 				in.panelX = std::clamp(px + static_cast<int>(u * pw), 0, winX - 1);
 				in.panelY = std::clamp(py + static_cast<int>((1.0f - v) * ph), 0, winY - 1);
 				panelT = t;
@@ -1218,17 +1298,62 @@ void CVRManager::Impl::UpdatePointer()
 				float3 center;
 				PanelRect(true, center, tv.width, tv.height);
 				tv.pose.position = ToXr(center);
-				TryPanel(tv, 0, 0, winX, winY);
+				TryPanel(tv, 0, 0, winX, winY, false);
 			}
 
 			for (const UIPanelLayer& layer: uiLayers) {
 				if (layer.visible)
-					TryPanel(layer.quad, layer.x, layer.y, layer.w, layer.h);
+					TryPanel(layer.quad, layer.x, layer.y, layer.w, layer.h, layer.canvas);
 			}
 		}
 	}
 
+	// VR UI panels (RmlUi "vr_" contexts) take the pointer directly, never the
+	// desktop cursor. A press keeps its target (UI or world) until release, so a
+	// drag that starts in the world never clicks the UI, and the reverse.
+	const bool wants[2] = {in.left, in.right};
+	const bool uiHeld = uiButtons[0] || uiButtons[1];
+	const bool toUI = uiHeld || (!worldHeld && onCanvas);
+
+	if (toUI) {
+		if (onCanvas) {
+			VRRml::PointerMove(in.panelX, in.panelY);
+			uiHover = true;
+		}
+		for (int b = 0; b < 2; ++b) {
+			if (wants[b] && !uiButtons[b] && onCanvas) {
+				VRRml::PointerButton(b, true);
+				uiButtons[b] = true;
+			} else if (!wants[b] && uiButtons[b]) {
+				VRRml::PointerButton(b, false);
+				uiButtons[b] = false;
+			}
+		}
+
+		// the desktop side sees no pointer this frame (and lets go of nothing it holds)
+		VRPointer::Input none;
+		VRPointer::Update(none);
+		worldHeld = false;
+
+		if (onCanvas) {
+			pointerHit = 2;
+			pointerHitPos = m.Pos(panelHitXR);
+		}
+		return;
+	}
+
+	if (uiHover) {
+		VRRml::PointerLeave();
+		uiHover = false;
+	}
+	if (onCanvas) {
+		// a world drag passing over the UI: the world keeps the pointer
+		in.onPanel = false;
+		panelT = -1.0f;
+	}
+
 	const VRPointer::Result result = VRPointer::Update(in);
+	worldHeld = in.left || in.right;
 
 	if (in.onPanel && panelT > 0.0f) {
 		pointerHit = 2;
@@ -1270,8 +1395,10 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 	const int winX = globalRendering->winSizeX;
 	const int winY = globalRendering->winSizeY;
 	const bool inGameView = eyesDrawn && tableView;
-	const bool anyUI = inGameView && std::any_of(uiLayers.begin(), uiLayers.end(), [](const UIPanelLayer& l) { return l.visible; });
+	const bool anyUI = inGameView && std::any_of(uiLayers.begin(), uiLayers.end(), [](const UIPanelLayer& l) { return l.visible && !l.canvas; });
+	const bool anyCanvas = inGameView && std::any_of(uiLayers.begin(), uiLayers.end(), [](const UIPanelLayer& l) { return l.visible && l.canvas; });
 	const bool resolved = frameState.shouldRender && haveFrame && (TVVisible(inGameView) || anyUI) && ResolveBackBuffer(0, 0, winX, winY);
+	const bool canvasReady = frameState.shouldRender && haveFrame && anyCanvas && RenderCanvas(winX, winY);
 
 	if (resolved && TVVisible(inGameView) && BlitResolvedTo(mirror, 0, 0, winX, winY)) {
 		panel.space = localSpace;
@@ -1294,7 +1421,7 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 	// used and no sub-image origin convention is involved
 	int uiCount = 0;
 	for (UIPanelLayer& layer: uiLayers) {
-		if (!resolved || !anyUI || !layer.visible || uiCount >= MAX_UI_LAYERS)
+		if (!layer.visible || uiCount >= MAX_UI_LAYERS || !(layer.canvas ? canvasReady : resolved))
 			continue;
 
 		if (layer.sc.handle != XR_NULL_HANDLE && (layer.sc.sizeX != layer.w || layer.sc.sizeY != layer.h)) {
@@ -1307,7 +1434,7 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 		}
 
 		// window rows count down from the top; GL rows count up from the bottom
-		if (!BlitResolvedTo(layer.sc, layer.x, winY - (layer.y + layer.h), layer.w, layer.h))
+		if (!BlitResolvedTo(layer.sc, layer.x, winY - (layer.y + layer.h), layer.w, layer.h, layer.canvas ? canvasFBO : 0))
 			continue;
 
 		XrCompositionLayerQuad& quad = uiQuads[uiCount++];
@@ -1318,6 +1445,10 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 		quad.subImage.imageRect.offset = {0, 0};
 		quad.subImage.imageRect.extent = {layer.sc.sizeX, layer.sc.sizeY};
 		quad.subImage.imageArrayIndex = 0;
+		// VR UI panels have transparent parts (rounded corners, gaps); RmlUi
+		// output is premultiplied, which is what the compositor expects
+		if (layer.canvas)
+			quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 		quad.pose = layer.quad.pose;
 		quad.size = {layer.quad.width, layer.quad.height};
 
