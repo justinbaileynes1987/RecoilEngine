@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "System/float3.h"
+
 class CCamera;
 
 // Zero-K VR: state that ordinary rendering code checks while the headset's
@@ -24,6 +26,29 @@ namespace VRState {
 	inline const CCamera* ScreenCamera(const CCamera* current) {
 		return (eyePass && desktopCamera != nullptr) ? desktopCamera : current;
 	}
+
+	// What the controller pointer points at, picked along its own ray with
+	// the volumes the headset shows (TraceRay::GuiTraceRay with pickFromEye).
+	// While active, GUI traces along the cursor ray (from the desktop camera
+	// through the cursor pixel: selection clicks, orders, tooltips,
+	// Spring.TraceScreenRay at the cursor) return this pick instead of
+	// re-picking from the desktop camera, where a unit can hide behind another
+	// or behind a desktop-sized icon. Unsynced: it only changes which unit a
+	// local click means.
+	struct CursorPick {
+		bool active = false;
+		float3 camPos;    // desktop camera position
+		float3 camDir;    // cursor ray direction (mouse->dir)
+		int unitID = -1;
+		int featureID = -1;
+		float3 pos;       // where the pointer meets the unit, feature or ground
+	};
+	inline CursorPick cursorPick;
+
+	// true while the pointer's own pick runs: unit icons are judged as seen
+	// from pickEyePos (the headset), like in the eye views
+	inline bool pickFromEye = false;
+	inline float3 pickEyePos;
 
 	// unit icons in the eye views, as tangents of angles seen from the eye:
 	// a unit whose radius looks smaller than iconSwitchTan is drawn as an icon,

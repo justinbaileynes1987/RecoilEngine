@@ -854,6 +854,15 @@ void CVRManager::Impl::UpdatePointer()
 		in.dir = m.Dir(dirXR).SafeNormalize();
 		in.length = POINTER_LENGTH * m.scale;
 
+		// the headset, for judging which units the eyes see as icons
+		// (falls back to the controller if the eyes aren't located yet)
+		in.eye = in.from;
+		if (viewsValid) {
+			const XrVector3f& a = views[0].pose.position;
+			const XrVector3f& b = views[1].pose.position;
+			in.eye = m.Pos({(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f});
+		}
+
 		// the panel faces the player (+z); a hit on it wins over the world
 		if (showPanel && dirXR.z < -1e-4f && globalRendering->winSizeX > 0 && globalRendering->winSizeY > 0) {
 			float3 center;

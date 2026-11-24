@@ -19,6 +19,8 @@
 #include "Game/UI/MouseHandler.h"
 #include "Game/UI/ScanCodes.h"
 #include "Map/Ground.h"
+#include "Rendering/VR/VRState.h"
+#include "Sim/Features/Feature.h"
 #include "Map/ReadMap.h"
 #include "Rendering/GlobalRendering.h"
 #include "Sim/Misc/GlobalConstants.h"
@@ -163,6 +165,7 @@ void VRPointer::SetShift(bool down)
 void VRPointer::Release()
 {
 	SetShift(false);
+	VRState::cursorPick.active = false;
 
 	if (mouse == nullptr) {
 		std::fill(std::begin(held), std::end(held), false);
@@ -194,6 +197,15 @@ VRPointer::Result VRPointer::Update(const Input& in)
 	int px = 0;
 	int py = 0;
 
+	// what the pointer picks in the world; handed to the engine's GUI traces
+	// along the cursor ray (VRState::CursorPick), so selection and orders use
+	// it instead of re-picking from the overhead desktop camera
+	bool worldPick = false;
+	int pickUnitID = -1;
+	int pickFeatureID = -1;
+
+	VRState::cursorPick.active = false;
+
 	if (in.onPanel) {
 		haveTarget = true;
 		px = in.panelX;
@@ -201,17 +213,25 @@ VRPointer::Result VRPointer::Update(const Input& in)
 	} else if (in.rayValid) {
 		const CUnit* hitUnit = nullptr;
 		const CFeature* hitFeature = nullptr;
+
+		// pick along the controller ray, judging icons as the headset shows them
+		VRState::pickFromEye = true;
+		VRState::pickEyePos = in.eye;
 		const float dist = TraceRay::GuiTraceRay(in.from, in.dir, in.length, nullptr, hitUnit, hitFeature, true);
+		VRState::pickFromEye = false;
 
 		if (dist >= 0.0f) {
 			result.worldHit = true;
 			result.pos = in.from + in.dir * dist;
 
-			// aim at the middle of a unit so the click from the overhead
-			// desktop camera lands on it too
-			const float3 target = (hitUnit != nullptr) ? hitUnit->drawMidPos : result.pos;
+			worldPick = true;
+			pickUnitID = (hitUnit != nullptr) ? hitUnit->id : -1;
+			pickFeatureID = (hitFeature != nullptr) ? hitFeature->id : -1;
+
+			// the cursor goes where the hit point is seen from the desktop
+			// camera, so ground positions match exactly
 			const CCamera* cam = CCameraHandler::GetCamera(CCamera::CAMTYPE_PLAYER);
-			const float3 vp = cam->CalcViewPortCoordinates(target);
+			const float3 vp = cam->CalcViewPortCoordinates(result.pos);
 
 			const int vx = std::clamp(static_cast<int>(vp.x), 0, globalRendering->viewSizeX - 1);
 			const int vy = std::clamp(static_cast<int>(vp.y), 0, globalRendering->viewSizeY - 1);
@@ -244,6 +264,17 @@ VRPointer::Result VRPointer::Update(const Input& in)
 		mouse->MouseMove(px, py, (lastX >= 0) ? (px - lastX) : 0, (lastY >= 0) ? (py - lastY) : 0);
 		lastX = px;
 		lastY = py;
+	}
+
+	// publish the pick for traces along the cursor ray (before any click)
+	if (worldPick && !yielded) {
+		VRState::CursorPick& pick = VRState::cursorPick;
+		pick.active = true;
+		pick.camPos = CCameraHandler::GetCamera(CCamera::CAMTYPE_PLAYER)->GetPos();
+		pick.camDir = mouse->dir;
+		pick.unitID = pickUnitID;
+		pick.featureID = pickFeatureID;
+		pick.pos = result.pos;
 	}
 
 	for (int b = 0; b < NUM_POINTER_BUTTONS; ++b) {

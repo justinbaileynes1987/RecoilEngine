@@ -6,7 +6,10 @@
 #include "GlobalUnsynced.h"
 #include "Map/Ground.h"
 #include "Rendering/GlobalRendering.h"
+#include "Rendering/IconHandler.h"
+#include "Rendering/VR/VRState.h"
 #include "Sim/Features/Feature.h"
+#include "Sim/Features/FeatureHandler.h"
 #include "Sim/Misc/CollisionHandler.h"
 #include "Sim/Misc/CollisionVolume.h"
 #include "Sim/Misc/GeometricObjects.h"
@@ -368,6 +371,70 @@ void TraceRayShields(
 }
 
 
+// Zero-K VR: is the unit drawn as an icon in the headset, and how big? Mirrors
+// UpdateUnitIconStateVR (UnitDrawerData.cpp) and the eye-pass icon size in
+// CUnitDrawerGLSL::DrawUnitIcon. Unsynced: only used for GUI picking.
+static bool VRPickIcon(const CUnit* u, float& iconRadius)
+{
+	if (u->currentIconIndex == icon::INVALID_ICON_INDEX || u->noDraw || u->IsInVoid())
+		return false;
+
+	const unsigned short losStatus = u->losStatus[gu->myAllyTeam];
+
+	const float dist = VRState::pickEyePos.distance(u->drawMidPos);
+	const auto& iconData = icon::iconHandler.GetIconData(u->currentIconIndex);
+
+	iconRadius = iconData.GetSize() * dist * VRState::iconHalfSizeTan;
+	if (iconData.GetRadiusAdjust() && u->currentIconIndex != icon::iconHandler.GetDefaultIconIdx())
+		iconRadius *= (u->radius / iconData.GetRadiusScale());
+
+	if ((losStatus & LOS_INLOS) == 0 && !gu->spectatingFullView)
+		return ((losStatus & LOS_INRADAR) != 0);
+
+	return (u->radius < dist * VRState::iconSwitchTan);
+}
+
+// Zero-K VR: a GUI trace along the cursor ray while the controller pointer
+// drives the cursor; answers with what the pointer picked (see VRState::CursorPick)
+static float VRCursorTrace(
+	const float3& start,
+	const float3& dir,
+	const float length,
+	const CUnit*& hitUnit,
+	const CFeature*& hitFeature,
+	bool useRadar,
+	bool ignoreWater
+) {
+	const VRState::CursorPick& pick = VRState::cursorPick;
+
+	const CUnit* unit = (pick.unitID >= 0) ? unitHandler.GetUnit(pick.unitID) : nullptr;
+	const CFeature* feature = (pick.featureID >= 0) ? featureHandler.GetFeature(pick.featureID) : nullptr;
+
+	// the pick sees radar blips; callers that don't want them get the ground
+	if (unit != nullptr && !useRadar && !gu->spectatingFullView) {
+		const bool enemy = !teamHandler.Ally(unit->allyteam, gu->myAllyTeam);
+		const bool inSight = (unit->losStatus[gu->myAllyTeam] & (LOS_INLOS | LOS_CONTRADAR)) != 0;
+		if (enemy && !inSight)
+			unit = nullptr;
+	}
+
+	// the cursor pixel is the pointer's hit point seen from the desktop camera,
+	// so the hit lies on this ray
+	const float dist = (pick.pos - start).dot(dir);
+
+	if ((unit != nullptr || feature != nullptr) && dist > 0.0f && dist <= length) {
+		hitUnit = unit;
+		hitFeature = (unit != nullptr) ? nullptr : feature;
+		return dist;
+	}
+
+	// nothing picked: the ground (or water) under the cursor
+	const CUnit* groundUnit = nullptr;
+	const CFeature* groundFeature = nullptr;
+	return GuiTraceRay(start, dir, length, nullptr, groundUnit, groundFeature, useRadar, true, ignoreWater);
+}
+
+
 float GuiTraceRay(
 	const float3& start,
 	const float3& dir,
@@ -385,6 +452,11 @@ float GuiTraceRay(
 
 	if (dir == ZeroVector)
 		return -1.0f;
+
+	// Zero-K VR: the cursor ray while the controller pointer drives the cursor
+	if (VRState::cursorPick.active && !VRState::pickFromEye && !groundOnly && exclude == nullptr &&
+	    start.SqDistance(VRState::cursorPick.camPos) < 1.0f && dir.dot(VRState::cursorPick.camDir) > 0.9999999f)
+		return VRCursorTrace(start, dir, length, hitUnit, hitFeature, useRadar, ignoreWater);
 
 	// ground and water-plane intersection
 	const float    guiRayLength = length;
@@ -452,11 +524,15 @@ float GuiTraceRay(
 
 			CollisionVolume cv = u->selectionVolume;
 
+			// Zero-K VR: the pointer picks icons as the headset shows them
+			float iconRadius = u->iconRadius;
+			const bool isIcon = VRState::pickFromEye ? VRPickIcon(u, iconRadius) : u->GetIsIcon();
+
 			// for iconified units, just pretend the collision
 			// volume is a sphere of radius <unit->IconRadius>
 			// (count radar blips as such too)
-			if (u->GetIsIcon() || (!unitInSight && unitOnRadar && unitIsEnemy))
-				cv.InitSphere(u->iconRadius);
+			if (isIcon || (!unitInSight && unitOnRadar && unitIsEnemy))
+				cv.InitSphere(iconRadius);
 
 			if (CCollisionHandler::MouseHit(u, u->GetTransformMatrix(false), start, start + dir * guiRayLength, &cv, &cq)) {
 				// get the distance to the ray-volume ingress point
