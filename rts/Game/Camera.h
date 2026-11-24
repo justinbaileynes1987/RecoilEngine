@@ -274,6 +274,7 @@ public:
 		float3 right;
 		float3 up;
 		float4 tanFov;
+		float minViewRange = 0.0f; // far plane at least this far (elmos)
 	};
 	VROverride vrOverride;
 

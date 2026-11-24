@@ -38,6 +38,9 @@
 #include "Game/CameraHandler.h"
 #include "Map/ReadMap.h"
 #include "Sim/Misc/GlobalConstants.h"
+#include "Rendering/Env/ISky.h"
+#include "Rendering/GL/RenderBuffers.h"
+#include "System/Color.h"
 
 CONFIG(bool, VREnable).defaultValue(false).description("Zero-K VR: start an OpenXR session and show the game in a connected headset.");
 CONFIG(bool, VRStereo).defaultValue(true).description("Zero-K VR: draw the battlefield in stereo around the player camera. When off, only the floating desktop panel is shown.");
@@ -48,6 +51,7 @@ CONFIG(float, VRTableHeight).defaultValue(-0.5f).description("Zero-K VR (table v
 CONFIG(float, VRWorldScale).defaultValue(300.0f).minimumValue(1.0f).description("Zero-K VR (camera view): game distance units (elmos) per real-world metre of head movement.");
 CONFIG(float, VRMirrorDistance).defaultValue(1.5f).minimumValue(0.3f).description("Zero-K VR: distance in metres from the starting head position to the desktop panel (UI). In-game with the table view, the panel stands behind the table instead.");
 CONFIG(int, VRDebugCapture).defaultValue(0).minimumValue(0).description("Zero-K VR: if N > 0, save both eye images (vr-eye-0.png, vr-eye-1.png) to the write dir on the Nth frame that draws the eyes, and log the eye positions.");
+CONFIG(bool, VRPanel).defaultValue(true).description("Zero-K VR: show the desktop frame (with the UI) as a floating panel. Turn off to see only the stereo view.");
 CONFIG(float, VRMirrorWidth).defaultValue(1.6f).minimumValue(0.1f).description("Zero-K VR: width in metres of the desktop panel (UI).");
 
 
@@ -105,6 +109,7 @@ struct CVRManager::Impl
 	float mirrorDistance = 1.5f;
 	float mirrorWidth = 1.6f;
 
+	bool showPanel = true;
 	int debugCaptureFrame = 0; // VRDebugCapture
 	int eyeFrames = 0;         // frames on which the eyes were drawn
 
@@ -530,7 +535,7 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 		layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
 	}
 
-	if (frameState.shouldRender && haveFrame && CopyBackBufferTo(mirror, 0, 0, globalRendering->winSizeX, globalRendering->winSizeY)) {
+	if (frameState.shouldRender && haveFrame && (showPanel || !eyesDrawn) && CopyBackBufferTo(mirror, 0, 0, globalRendering->winSizeX, globalRendering->winSizeY)) {
 		panel.space = localSpace;
 		panel.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
 		panel.subImage.swapchain = mirror.handle;
@@ -544,10 +549,10 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 		panel.size = {mirrorWidth, mirrorWidth * aspect};
 
 		if (eyesDrawn && tableView) {
-			// in-game: stand the panel upright behind the table, its bottom edge
-			// just above the table surface, like a screen on the war-room wall
+			// in-game: a screen on the war-room wall behind the table, its bottom
+			// edge at eye level so the table below stays in clear view
 			const float behindTable = tableDistance + tableSize * 0.5f + 0.3f;
-			panel.pose.position = {0.0f, tableHeight + 0.1f + panel.size.height * 0.5f, -std::max(behindTable, mirrorDistance)};
+			panel.pose.position = {0.0f, panel.size.height * 0.5f, -std::max(behindTable, mirrorDistance)};
 		} else {
 			panel.pose.position = {0.0f, 0.0f, -mirrorDistance};
 		}
@@ -594,6 +599,7 @@ void CVRManager::Init()
 	impl->stereo = configHandler->GetBool("VRStereo");
 	impl->tableView = (configHandler->GetString("VRView") != "camera");
 	impl->debugCaptureFrame = configHandler->GetInt("VRDebugCapture");
+	impl->showPanel = configHandler->GetBool("VRPanel");
 	impl->tableSize = configHandler->GetFloat("VRTableSize");
 	impl->tableDistance = configHandler->GetFloat("VRTableDistance");
 	impl->tableHeight = configHandler->GetFloat("VRTableHeight");
@@ -643,6 +649,71 @@ void CVRManager::BeginFrame()
 
 	if (impl->frameState.shouldRender)
 		impl->LocateViews();
+}
+
+
+// greybox war room for the table view: a table slab under the map and a floor
+// grid, in world coordinates (elmos); toWorld maps OpenXR LOCAL metres
+template<typename ToWorld>
+static void DrawGreyboxRoom(const CCamera* cam, const ToWorld& toWorld, float scale, float tableHeight, float tableDistance)
+{
+	const float mapX = static_cast<float>(mapDims.mapx * SQUARE_SIZE);
+	const float mapZ = static_cast<float>(mapDims.mapy * SQUARE_SIZE);
+	const float margin = 0.03f * scale;
+	const float topY = std::min(readMap->GetInitMinHeight(), 0.0f) - 0.002f * scale;
+	const float botY = topY - 0.04f * scale;
+
+	const float x0 = -margin, x1 = mapX + margin;
+	const float z0 = -margin, z1 = mapZ + margin;
+
+	const SColor topCol(58, 56, 52, 255);
+	const SColor sideCol(40, 38, 35, 255);
+	const SColor floorCol(28, 29, 31, 255);
+	const SColor gridCol(70, 74, 80, 255);
+
+	auto& rb = RenderBuffer::GetTypedRenderBuffer<VA_TYPE_C>();
+
+	// table top and sides
+	rb.AddQuadTriangles({{x0, topY, z0}, topCol}, {{x1, topY, z0}, topCol}, {{x1, topY, z1}, topCol}, {{x0, topY, z1}, topCol});
+	rb.AddQuadTriangles({{x0, topY, z1}, sideCol}, {{x1, topY, z1}, sideCol}, {{x1, botY, z1}, sideCol}, {{x0, botY, z1}, sideCol});
+	rb.AddQuadTriangles({{x0, topY, z0}, sideCol}, {{x1, topY, z0}, sideCol}, {{x1, botY, z0}, sideCol}, {{x0, botY, z0}, sideCol});
+	rb.AddQuadTriangles({{x0, topY, z0}, sideCol}, {{x0, topY, z1}, sideCol}, {{x0, botY, z1}, sideCol}, {{x0, botY, z0}, sideCol});
+	rb.AddQuadTriangles({{x1, topY, z0}, sideCol}, {{x1, topY, z1}, sideCol}, {{x1, botY, z1}, sideCol}, {{x1, botY, z0}, sideCol});
+
+	// floor 0.75 m below the table top, 8 x 8 m around the starting position
+	const float floorXR = tableHeight - 0.75f;
+	const float3 f00 = toWorld(-4.0f, floorXR, -4.0f);
+	const float3 f11 = toWorld( 4.0f, floorXR,  4.0f);
+	rb.AddQuadTriangles({{f00.x, f00.y, f00.z}, floorCol}, {{f11.x, f00.y, f00.z}, floorCol}, {{f11.x, f00.y, f11.z}, floorCol}, {{f00.x, f00.y, f11.z}, floorCol});
+
+	auto& shader = rb.GetShader();
+
+	glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadMatrixf(cam->GetProjectionMatrix());
+	glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadMatrixf(cam->GetViewMatrix());
+
+	glEnable(GL_DEPTH_TEST);
+	glDepthMask(GL_TRUE);
+	glDisable(GL_BLEND);
+	glDisable(GL_CULL_FACE);
+
+	shader.Enable();
+	rb.DrawElements(GL_TRIANGLES);
+
+	// floor grid lines every 0.5 m, slightly above the floor
+	const float gridY = f00.y + 0.002f * scale;
+	for (int i = -8; i <= 8; ++i) {
+		const float3 a = toWorld(i * 0.5f, floorXR, -4.0f);
+		const float3 b = toWorld(i * 0.5f, floorXR,  4.0f);
+		const float3 c = toWorld(-4.0f, floorXR, i * 0.5f);
+		const float3 d = toWorld( 4.0f, floorXR, i * 0.5f);
+		rb.AddVertex({{a.x, gridY, a.z}, gridCol}); rb.AddVertex({{b.x, gridY, b.z}, gridCol});
+		rb.AddVertex({{c.x, gridY, c.z}, gridCol}); rb.AddVertex({{d.x, gridY, d.z}, gridCol});
+	}
+	rb.DrawArrays(GL_LINES);
+	shader.Disable();
+
+	glMatrixMode(GL_PROJECTION); glPopMatrix();
+	glMatrixMode(GL_MODELVIEW);  glPopMatrix();
 }
 
 
@@ -724,6 +795,18 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 
 	bool ok = true;
 
+	// the miniature has no fog and no sky: push fog past the far plane and
+	// make the clear colour (the sky's fog colour) a dark room
+	ISky* sky = ISky::GetSky().get();
+	const float savedFogStart = sky->fogStart;
+	const float savedFogEnd = sky->fogEnd;
+	const float4 savedFogColor = sky->fogColor;
+	if (impl->tableView) {
+		sky->fogStart = 100.0f;
+		sky->fogEnd = 101.0f;
+		sky->fogColor = float4(0.07f, 0.075f, 0.08f, 1.0f);
+	}
+
 	impl->eyeFrames += 1;
 	const bool captureThisFrame = (impl->debugCaptureFrame > 0 && impl->eyeFrames == impl->debugCaptureFrame);
 	// log the eyes on the first frame, every ~10 s at 90 Hz, and when capturing
@@ -746,6 +829,7 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 		ovr.forward = ToWorldDir(Rotate(pose.orientation, {0.0f, 0.0f, -1.0f})).Normalize();
 		ovr.up      = ToWorldDir(Rotate(pose.orientation, {0.0f, 1.0f,  0.0f})).Normalize();
 		ovr.right   = ToWorldDir(Rotate(pose.orientation, {1.0f, 0.0f,  0.0f})).Normalize();
+		ovr.minViewRange = impl->tableView ? (8.0f * scale) : 0.0f; // see the room around the table
 		ovr.tanFov  = float4(std::tan(fov.angleLeft), std::tan(fov.angleRight), std::tan(fov.angleDown), std::tan(fov.angleUp));
 
 		// the culling frustum is symmetric and uses the desktop aspect ratio;
@@ -772,6 +856,11 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 
 		drawWorld();
 
+		if (impl->tableView) {
+			const auto xrToWorld = [&](float x, float y, float z) { return ToWorldPos(XrVector3f{x, y, z}); };
+			DrawGreyboxRoom(cam, xrToWorld, scale, impl->tableHeight, impl->tableDistance);
+		}
+
 		if (logThisFrame) {
 			const float3 p = cam->GetPos();
 			const float3 f = cam->GetForward();
@@ -789,6 +878,10 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 	cam->SetPos(savedPos);
 	cam->SetVFOV(savedFov);
 	cam->Update();
+
+	sky->fogStart = savedFogStart;
+	sky->fogEnd = savedFogEnd;
+	sky->fogColor = savedFogColor;
 
 	// restore the desktop camera's visibility and params for the desktop draw
 	VRState::eyePass = false;

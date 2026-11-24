@@ -356,6 +356,10 @@ void CCamera::UpdateViewRange()
 	wantedViewRange = std::clamp(wantedViewRange, CGlobalRendering::MIN_ZNEAR_DIST, CGlobalRendering::MAX_VIEW_RANGE);
 	#endif
 
+	// Zero-K VR: the eye views may need to see past the map (the virtual room)
+	if (vrOverride.active)
+		wantedViewRange = std::max(wantedViewRange, vrOverride.minViewRange);
+
 	frustum.scales.z = std::max(wantedViewRange * ZFAR_ZNEAR_FACTOR, globalRendering->minViewRange);
 	frustum.scales.w = std::min(wantedViewRange                    , globalRendering->maxViewRange);
 }

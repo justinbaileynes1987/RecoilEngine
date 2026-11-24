@@ -10,6 +10,7 @@
 #include "Rendering/Env/GrassDrawer.h"
 #include "Rendering/Env/IGroundDecalDrawer.h"
 #include "Rendering/Env/ISky.h"
+#include "Rendering/VR/VRState.h"
 #include "Rendering/Env/SunLighting.h"
 #include "Rendering/Env/WaterRendering.h"
 #include "Rendering/Env/MapRendering.h"
@@ -355,8 +356,11 @@ void CWorldDrawer::DrawOpaqueObjects() const
 
 	// not an opaque rendering, but makes sense to run after the terrain was rendered
 	{
-		const auto& sky = ISky::GetSky();
-		sky->Draw();
+		// Zero-K VR: no sky around the miniature in the eye views
+		if (!VRState::eyePass) {
+			const auto& sky = ISky::GetSky();
+			sky->Draw();
+		}
 	}
 
 	selectedUnitsHandler.Draw();
