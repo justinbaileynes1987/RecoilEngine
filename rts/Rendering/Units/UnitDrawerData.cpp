@@ -210,6 +210,26 @@ void CUnitDrawerData::ConfigNotify(const std::string& key, const std::string& va
 	ghostIconDimming = configHandler->GetFloat("UnitGhostIconsDimming");
 }
 
+// Zero-K VR: in the eye views, switch units to icons by how big they look from
+// the eye (the eye can be thousands of elmos from a miniature it is close to)
+static void UpdateUnitIconStateVR(CUnit* unit)
+{
+	if (unit->currentIconIndex == icon::INVALID_ICON_INDEX || unit->noDraw || unit->IsInVoid()) {
+		unit->SetIsIcon(false);
+		return;
+	}
+
+	const unsigned short losStatus = unit->losStatus[gu->myAllyTeam];
+
+	if ((losStatus & LOS_INLOS) == 0 && !gu->spectatingFullView) {
+		unit->SetIsIcon((losStatus & LOS_INRADAR) != 0);
+		return;
+	}
+
+	const float dist = camera->GetPos().distance(unit->drawMidPos);
+	unit->SetIsIcon(unit->radius < dist * VRState::iconSwitchTan);
+}
+
 void CUnitDrawerData::Update()
 {
 	RECOIL_DETAILED_TRACY_ZONE;
@@ -326,26 +346,6 @@ void CUnitDrawerData::UpdateCurrentUnitIcon(const CUnit* unit)
 	else {
 		unit->currentIconIndex = icon::INVALID_ICON_INDEX;
 	}
-}
-
-// Zero-K VR: in the eye views, switch units to icons by how big they look from
-// the eye (the eye can be thousands of elmos from a miniature it is close to)
-static void UpdateUnitIconStateVR(CUnit* unit)
-{
-	if (unit->currentIconIndex == icon::INVALID_ICON_INDEX || unit->noDraw || unit->IsInVoid()) {
-		unit->SetIsIcon(false);
-		return;
-	}
-
-	const unsigned short losStatus = unit->losStatus[gu->myAllyTeam];
-
-	if ((losStatus & LOS_INLOS) == 0 && !gu->spectatingFullView) {
-		unit->SetIsIcon((losStatus & LOS_INRADAR) != 0);
-		return;
-	}
-
-	const float dist = camera->GetPos().distance(unit->drawMidPos);
-	unit->SetIsIcon(unit->radius < dist * VRState::iconSwitchTan);
 }
 
 void CUnitDrawerData::UpdateUnitIconState(CUnit* unit)
