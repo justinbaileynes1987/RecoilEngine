@@ -18,7 +18,9 @@ namespace {
 	 *
 	 * @function Spring.SetVRPanels
 	 * @param panels table array of {name=string, anchor="bar"|"palette", source="desktop"|"vr", x=number, y=number, w=number, h=number}
-	 *   x, y: top-left corner in window pixels (y down, like Chili); w, h: size in pixels.
+	 *   hidden (optional): keep the panel (and its headset swapchain) but do not show it;
+ *   showing it later is then instant, and the swapchain is made while nothing else draws.
+ *   x, y: top-left corner in window pixels (y down, like Chili); w, h: size in pixels.
 	 *   width (optional): physical width in metres; otherwise VRBarScale / VRPaletteScale metres per pixel.
 	 *   source "vr": cut from the VR UI canvas, where RmlUi contexts named "vr_*" are
 	 *   drawn (window-sized, never shown on the desktop); the pointer drives those
@@ -59,6 +61,10 @@ namespace {
 				lua_getfield(L, -1, "width");
 				if (lua_isnumber(L, -1))
 					p.widthM = static_cast<float>(lua_tonumber(L, -1));
+				lua_pop(L, 1);
+
+				lua_getfield(L, -1, "hidden");
+				p.hidden = lua_toboolean(L, -1);
 				lua_pop(L, 1);
 
 				lua_getfield(L, -1, "source");

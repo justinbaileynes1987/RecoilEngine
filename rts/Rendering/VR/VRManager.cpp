@@ -64,14 +64,15 @@ CONFIG(float, VRIconSize).defaultValue(0.9f).minimumValue(0.05f).description("Ze
 CONFIG(bool, VRPanel).defaultValue(true).description("Zero-K VR: show the desktop frame (with the UI) as a floating panel. Turn off to see only the stereo view.");
 CONFIG(bool, VRPointer).defaultValue(true).description("Zero-K VR (table view): use the controller pointer as the mouse (pointer hand: trigger = left click, A/X = right click; other hand: trigger holds Shift). The desktop camera is held over the whole map while VR runs, so every point the pointer reaches is on screen.");
 CONFIG(float, VRPointerMargin).defaultValue(1.6f).minimumValue(1.0f).description("Zero-K VR (table view, pointer on): how much room the desktop view leaves around the map, as a multiple of the map size, so pointer clicks stay clear of the UI at the screen edges.");
-CONFIG(float, VRMirrorWidth).defaultValue(1.77f).minimumValue(0.1f).description("Zero-K VR: width in metres of the desktop panel (UI). The default, 1.77, is an 80-inch 16:9 TV.");
-CONFIG(bool, VRUIPanels).defaultValue(true).description("Zero-K VR (table view): show the UI panels LuaUI asks for (Spring.SetVRPanels): a bar on the table edge facing you, panels at your side that follow you, and a palette on the off hand. While there are any, the big desktop panel is hidden until the pointer hand's thumbstick click shows it.");
+CONFIG(float, VRMirrorWidth).defaultValue(2.21f).minimumValue(0.1f).description("Zero-K VR: width in metres of the desktop panel (UI). The default, 2.21, is a 100-inch 16:9 TV.");
+CONFIG(bool, VRUIPanels).defaultValue(true).description("Zero-K VR (table view): show the UI panels LuaUI asks for (Spring.SetVRPanels): a bar on the table edge facing you, panels at your side that follow you, and a palette on the off hand. The big desktop panel stays up as well; the pointer hand's thumbstick click hides or shows it.");
 CONFIG(float, VRBarScale).defaultValue(0.0007f).minimumValue(0.0001f).description("Zero-K VR: size of the table-edge UI bar, in metres per window pixel (when LuaUI gives no width).");
-CONFIG(float, VRBarMaxDistance).defaultValue(1.6f).minimumValue(0.3f).description("Zero-K VR: the table-edge UI bar comes no farther than this many metres (horizontally) from your head, however big the table is zoomed.");
+CONFIG(float, VRBarMaxDistance).defaultValue(1.6f).minimumValue(0.3f).description("Zero-K VR: the table-edge UI bar always stands on the table's far edge; when that is farther than this many metres (horizontally) from your head, it grows so it reads the same size.");
 CONFIG(float, VRPaletteScale).defaultValue(0.0005f).minimumValue(0.0001f).description("Zero-K VR: size of the off-hand UI palette, in metres per window pixel.");
 CONFIG(float, VRSideAngle).defaultValue(40.0f).description("Zero-K VR: how far round to the pointer hand's side the side UI panel (orders, build menu) sits, in degrees from where you face.");
 CONFIG(float, VRSideDistance).defaultValue(0.6f).minimumValue(0.2f).description("Zero-K VR: distance in metres from your head to the side UI panel.");
 CONFIG(float, VRSideHeight).defaultValue(-0.35f).description("Zero-K VR: height in metres of the side UI panel's centre relative to your eyes.");
+CONFIG(float, VRSideMaxAngle).defaultValue(100.0f).description("Zero-K VR: the side UI panel swings further round to your side, up to this many degrees from where you face, when it would hide the table from your eyes.");
 CONFIG(float, VRPaletteTilt).defaultValue(30.0f).description("Zero-K VR: how far the off-hand palette leans back from the controller's grip, in degrees, so its face points up towards your eyes.");
 
 
@@ -253,7 +254,7 @@ struct CVRManager::Impl
 	float tableHeight = -0.5f;
 	float worldScale = 300.0f;
 	float mirrorDistance = 2.2f;
-	float mirrorWidth = 1.77f;
+	float mirrorWidth = 2.21f;
 
 	bool showPanel = true;
 	int debugCaptureFrame = 0; // VRDebugCapture
@@ -300,13 +301,19 @@ struct CVRManager::Impl
 		float metresPerPixel = 0.0f;     // 0: the anchor's default scale (VRBarScale / VRPaletteScale)
 		int x = 0, y = 0, w = 0, h = 0; // window pixels, top-left origin
 		ColorSwapchain sc;
+		bool hidden = false;            // LuaUI keeps it but does not show it (its swapchain stays)
 		bool visible = false;           // this frame
 		PanelQuad quad;
 	};
 	std::vector<UIPanelLayer> uiLayers;
+	// swapchains of panels LuaUI dropped, kept by name: creating swapchains can
+	// fail in SteamVR (XR_ERROR_RUNTIME_FAILURE), so each is made once and reused
+	std::vector<std::pair<std::string, ColorSwapchain>> uiSpare;
+	int swapchainFailures = 0;    // in a row; retries are spaced out
+	int swapchainRetryIn = 0;     // frames until the next try after a failure
 	int uiPanelsVersionSeen = -1;
 	bool uiPanelsEnabled = true;  // VRUIPanels
-	bool tvShown = false;         // the big desktop panel, while UI panels exist (thumbstick toggle)
+	bool tvShown = true;          // the big desktop panel, while UI panels exist (thumbstick toggle; shown by default)
 	bool paletteShown = false;    // the off-hand palette faces the head (with hysteresis)
 	// VR UI (RmlUi) pointer state: buttons held on the UI, hovering it, or a
 	// button held in the world (a drag), so a press keeps its target until release
@@ -321,6 +328,10 @@ struct CVRManager::Impl
 	float sideAngle = 0.7f;    // radians
 	float sideDistance = 0.6f;
 	float sideHeight = -0.35f;
+	float sideMaxAngle = 1.745f; // radians
+	float sideAngleNow = 0.0f;  // the angle in use, eased towards the clearest one
+	float sideLiftNow = 0.0f;   // metres raised above VRSideHeight to clear the table, eased
+	bool sideAngleValid = false;
 	bool uiButtons[2] = {false, false};
 	bool uiHover = false;
 	bool worldHeld = false;
@@ -336,6 +347,7 @@ struct CVRManager::Impl
 	float paletteTilt = 0.52f;    // radians
 	void SyncUIPanels();
 	void LayoutUIPanels();
+	void EnsureUISwapchains();
 	static float Scale(const UIPanelLayer& layer, float anchorScale) {
 		return (layer.metresPerPixel > 0.0f) ? layer.metresPerPixel : anchorScale;
 	}
@@ -544,8 +556,10 @@ bool CVRManager::Impl::CreateColorSwapchain(int32_t sizeX, int32_t sizeY, ColorS
 	swapchainInfo.arraySize = 1;
 	swapchainInfo.mipCount = 1;
 
-	if (!Check(xrCreateSwapchain(session, &swapchainInfo, &sc.handle), "xrCreateSwapchain"))
+	if (!Check(xrCreateSwapchain(session, &swapchainInfo, &sc.handle), "xrCreateSwapchain")) {
+		sc.handle = XR_NULL_HANDLE;
 		return false;
+	}
 
 	uint32_t imageCount = 0;
 	if (!Check(xrEnumerateSwapchainImages(sc.handle, 0, &imageCount, nullptr), "xrEnumerateSwapchainImages"))
@@ -640,6 +654,13 @@ void CVRManager::Impl::Destroy()
 			xrDestroySwapchain(layer.sc.handle);
 	}
 	uiLayers.clear();
+	for (auto& spare: uiSpare) {
+		if (spare.second.handle != XR_NULL_HANDLE)
+			xrDestroySwapchain(spare.second.handle);
+	}
+	uiSpare.clear();
+	swapchainFailures = 0;
+	swapchainRetryIn = 0;
 	uiPanelsVersionSeen = -1;
 
 	input.Destroy();
@@ -1042,24 +1063,39 @@ void CVRManager::Impl::SyncUIPanels()
 		if (old != uiLayers.end()) {
 			layer.sc = old->sc;
 			old->sc = ColorSwapchain(); // moved
+		} else {
+			const auto spare = std::find_if(uiSpare.begin(), uiSpare.end(), [&](const auto& s) { return s.first == req.name; });
+			if (spare != uiSpare.end()) {
+				layer.sc = spare->second;
+				uiSpare.erase(spare);
+			}
 		}
 
 		layer.name = req.name;
 		layer.anchor = req.anchor;
 		layer.canvas = req.canvas;
+		layer.hidden = req.hidden;
 		layer.x = x0;
 		layer.y = y0;
 		layer.w = x1 - x0;
 		layer.h = y1 - y0;
 		layer.metresPerPixel = (req.widthM > 0.0f) ? req.widthM / static_cast<float>(layer.w) : 0.0f;
 
-		summary += " " + layer.name + ((layer.anchor == VRState::UI_ANCHOR_PALETTE) ? "(palette " : (layer.anchor == VRState::UI_ANCHOR_SIDE) ? "(side " : "(bar ") + std::to_string(layer.w) + "x" + std::to_string(layer.h) + ")";
+		summary += " " + layer.name + (layer.hidden ? "[hidden]" : "") + ((layer.anchor == VRState::UI_ANCHOR_PALETTE) ? "(palette " : (layer.anchor == VRState::UI_ANCHOR_SIDE) ? "(side " : "(bar ") + std::to_string(layer.w) + "x" + std::to_string(layer.h) + ")";
 		next.push_back(std::move(layer));
 	}
 
+	// dropped panels keep their swapchains for when they come back
 	for (UIPanelLayer& layer: uiLayers) {
-		if (layer.sc.handle != XR_NULL_HANDLE)
-			xrDestroySwapchain(layer.sc.handle);
+		if (layer.sc.handle == XR_NULL_HANDLE)
+			continue;
+		const auto spare = std::find_if(uiSpare.begin(), uiSpare.end(), [&](const auto& s) { return s.first == layer.name; });
+		if (spare != uiSpare.end()) {
+			xrDestroySwapchain(spare->second.handle);
+			spare->second = layer.sc;
+		} else {
+			uiSpare.emplace_back(layer.name, layer.sc);
+		}
 	}
 
 	uiLayers = std::move(next);
@@ -1067,7 +1103,7 @@ void CVRManager::Impl::SyncUIPanels()
 
 	static bool loggedFirst = false;
 	if (!loggedFirst && !uiLayers.empty()) {
-		LOG("[VR] UI panels from LuaUI:%s (pointer-hand thumbstick click shows the big desktop panel)", summary.c_str());
+		LOG("[VR] UI panels from LuaUI:%s (pointer-hand thumbstick click hides or shows the big desktop panel)", summary.c_str());
 		loggedFirst = true;
 	}
 }
@@ -1077,6 +1113,73 @@ void CVRManager::Impl::HideUIPanels()
 {
 	for (UIPanelLayer& layer: uiLayers) {
 		layer.visible = false;
+	}
+}
+
+
+// makes the UI panels' swapchains (hidden panels too, so showing one later is
+// instant), before anything draws this frame. SteamVR's xrCreateSwapchain can
+// fail with XR_ERROR_RUNTIME_FAILURE (seen in the headset 2026-11-24 for the
+// side panel, every frame, so it never showed): it is tried with no GL error
+// pending and nothing bound, and after a failure only every half second or so.
+void CVRManager::Impl::EnsureUISwapchains()
+{
+	if (swapchainRetryIn > 0) {
+		swapchainRetryIn--;
+		return;
+	}
+
+	for (UIPanelLayer& layer: uiLayers) {
+		if (layer.sc.handle != XR_NULL_HANDLE && (layer.sc.sizeX != layer.w || layer.sc.sizeY != layer.h)) {
+			xrDestroySwapchain(layer.sc.handle);
+			layer.sc = ColorSwapchain();
+		}
+		if (layer.sc.handle != XR_NULL_HANDLE)
+			continue;
+
+		GLenum pending = GL_NO_ERROR;
+		for (GLenum e; (e = glGetError()) != GL_NO_ERROR; )
+			pending = e;
+
+		bool made = false;
+		{
+			BlitStateGuard guard;
+			GLint prevUnpack = 0, prevPack = 0, prevActive = 0, prevTex = 0;
+			glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &prevUnpack);
+			glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &prevPack);
+			glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActive);
+			glActiveTexture(GL_TEXTURE0);
+			glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+			glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+			glBindTexture(GL_TEXTURE_2D, 0);
+
+			made = CreateColorSwapchain(layer.w, layer.h, layer.sc);
+
+			glBindTexture(GL_TEXTURE_2D, prevTex);
+			glActiveTexture(prevActive);
+			glBindBuffer(GL_PIXEL_PACK_BUFFER, prevPack);
+			glBindBuffer(GL_PIXEL_UNPACK_BUFFER, prevUnpack);
+		}
+
+		if (made) {
+			if (swapchainFailures > 0)
+				LOG("[VR] made the swapchain for UI panel %s (%dx%d) after %d failed tries", layer.name.c_str(), layer.w, layer.h, swapchainFailures);
+			swapchainFailures = 0;
+			continue;
+		}
+
+		if (layer.sc.handle != XR_NULL_HANDLE)
+			xrDestroySwapchain(layer.sc.handle);
+		layer.sc = ColorSwapchain();
+
+		if (swapchainFailures == 0 || (swapchainFailures % 20) == 0)
+			LOG_L(L_WARNING, "[VR] could not make the swapchain for UI panel %s (%dx%d), try %d (GL error before it: 0x%x); retrying", layer.name.c_str(), layer.w, layer.h, swapchainFailures + 1, pending);
+		swapchainFailures++;
+		swapchainRetryIn = 45;
+		return;
 	}
 }
 
@@ -1097,12 +1200,19 @@ void CVRManager::Impl::LayoutUIPanels()
 	if (viewsValid)
 		head = (ToF3(views[0].pose.position) + ToF3(views[1].pose.position)) * 0.5f;
 
+	// the table top's half extents, in metres, in its own frame
+	const float mapX = static_cast<float>(mapDims.mapx * SQUARE_SIZE);
+	const float mapZ = static_cast<float>(mapDims.mapy * SQUARE_SIZE);
+	const float mapMax = std::max(std::max(mapX, mapZ), 1.0f);
+	const float halfX = table.size * mapX / mapMax * 0.5f;
+	const float halfZ = table.size * mapZ / mapMax * 0.5f;
+
 	// the bar
 	{
 		float totalW = 0.0f;
 		int count = 0;
 		for (const UIPanelLayer& layer: uiLayers) {
-			if (layer.anchor != VRState::UI_ANCHOR_BAR)
+			if (layer.anchor != VRState::UI_ANCHOR_BAR || layer.hidden)
 				continue;
 			totalW += layer.w * Scale(layer, barScale);
 			count++;
@@ -1112,12 +1222,6 @@ void CVRManager::Impl::LayoutUIPanels()
 			constexpr float GAP = 0.02f;
 			constexpr float LEAN = 15.0f * 0.0174533f;
 			totalW += GAP * (count - 1);
-
-			const float mapX = static_cast<float>(mapDims.mapx * SQUARE_SIZE);
-			const float mapZ = static_cast<float>(mapDims.mapy * SQUARE_SIZE);
-			const float mapMax = std::max(std::max(mapX, mapZ), 1.0f);
-			const float halfX = table.size * mapX / mapMax * 0.5f;
-			const float halfZ = table.size * mapZ / mapMax * 0.5f;
 
 			// the bar stands on the table edge opposite the player, wherever they
 			// walk: its heading turns smoothly towards the head
@@ -1140,26 +1244,25 @@ void CVRManager::Impl::LayoutUIPanels()
 			float3 base = table.center + away * (edgeT + 0.05f);
 			base.y = table.center.y + 0.02f;
 
+			// it always stays on the edge, never over the battlefield (a panel is drawn
+			// over everything behind it); farther than VRBarMaxDistance it grows
+			// instead, so it reads the same size
 			float3 toBase = base - head;
 			toBase.y = 0.0f;
-			const float dist = toBase.Length();
-			if (dist > barMaxDistance) {
-				const float3 pulled = head + toBase * (barMaxDistance / dist);
-				base = float3(pulled.x, base.y, pulled.z);
-			}
+			const float grow = std::max(1.0f, toBase.Length() / barMaxDistance);
 
 			// face the player, top leaning away
 			const XrQuaternionf q = QuatMul(QuatAxisAngle(UpVector, barYaw), QuatAxisAngle(float3(1.0f, 0.0f, 0.0f), -LEAN));
 			const float3 right = ToF3(Rotate(q, {1.0f, 0.0f, 0.0f}));
 			const float3 up = ToF3(Rotate(q, {0.0f, 1.0f, 0.0f}));
 
-			float x = -totalW * 0.5f;
+			float x = -totalW * grow * 0.5f;
 			for (UIPanelLayer& layer: uiLayers) {
-				if (layer.anchor != VRState::UI_ANCHOR_BAR)
+				if (layer.anchor != VRState::UI_ANCHOR_BAR || layer.hidden)
 					continue;
 
-				const float w = layer.w * Scale(layer, barScale);
-				const float h = layer.h * Scale(layer, barScale);
+				const float w = layer.w * Scale(layer, barScale) * grow;
+				const float h = layer.h * Scale(layer, barScale) * grow;
 				const float3 c = base + right * (x + w * 0.5f) + up * (h * 0.5f);
 
 				layer.quad.pose.orientation = q;
@@ -1167,7 +1270,7 @@ void CVRManager::Impl::LayoutUIPanels()
 				layer.quad.width = w;
 				layer.quad.height = h;
 				layer.visible = true;
-				x += w + GAP;
+				x += w + GAP * grow;
 			}
 		}
 	}
@@ -1179,7 +1282,7 @@ void CVRManager::Impl::LayoutUIPanels()
 	{
 		float totalH = 0.0f;
 		for (const UIPanelLayer& layer: uiLayers) {
-			if (layer.anchor == VRState::UI_ANCHOR_SIDE)
+			if (layer.anchor == VRState::UI_ANCHOR_SIDE && !layer.hidden)
 				totalH += layer.h * Scale(layer, sideScale);
 		}
 
@@ -1209,19 +1312,89 @@ void CVRManager::Impl::LayoutUIPanels()
 
 			// pointer hand right (1): the panel goes to the right (clockwise, negative yaw)
 			const float sideSign = (pointerHand == 1) ? -1.0f : 1.0f;
-			const float panelYaw = sideYaw + sideSign * sideAngle;
-			const float3 dir = RotY(float3(0.0f, 0.0f, -1.0f), panelYaw);
-			float3 base = sidePos + dir * sideDistance;
-			base.y = sidePos.y + sideHeight;
 
-			// faces the head: its +z points back along dir
-			const XrQuaternionf q = QuatMul(QuatAxisAngle(UpVector, panelYaw), QuatAxisAngle(float3(1.0f, 0.0f, 0.0f), -LEAN));
+			float totalW = 0.0f;
+			for (const UIPanelLayer& layer: uiLayers) {
+				if (layer.anchor == VRState::UI_ANCHOR_SIDE && !layer.hidden)
+					totalW = std::max(totalW, layer.w * Scale(layer, sideScale));
+			}
+
+			// where the panel stands at a given angle round from the anchored yaw
+			struct SidePlace { float yaw; float3 base; XrQuaternionf q; };
+			const auto Place = [&](float angle, float lift) {
+				SidePlace p;
+				p.yaw = sideYaw + sideSign * angle;
+				p.base = sidePos + RotY(float3(0.0f, 0.0f, -1.0f), p.yaw) * sideDistance;
+				p.base.y = sidePos.y + sideHeight + lift;
+				// faces the head: its +z points back towards it
+				p.q = QuatMul(QuatAxisAngle(UpVector, p.yaw), QuatAxisAngle(float3(1.0f, 0.0f, 0.0f), -LEAN));
+				return p;
+			};
+
+			// how much of the table the panel hides from the eyes: rays from the
+			// head through a grid of points on the panel, counted where they land
+			// on the table top (with a margin for what stands on it). A panel is a
+			// compositor layer drawn over the whole eye image, so it hides the
+			// table whether it stands in front of it, inside it or beyond it.
+			const auto Blocked = [&](const SidePlace& p) {
+				constexpr float MARGIN = 0.05f;
+				const float3 right = ToF3(Rotate(p.q, {1.0f, 0.0f, 0.0f}));
+				const float3 up = ToF3(Rotate(p.q, {0.0f, 1.0f, 0.0f}));
+				int hits = 0;
+				for (int i = -2; i <= 2; ++i) {
+					for (int j = -2; j <= 2; ++j) {
+						const float3 pt = p.base + right * (i * totalW * 0.25f) + up * (j * totalH * 0.25f);
+						const float3 ray = pt - head;
+						if (ray.y >= -1e-4f)
+							continue; // looking level or up: never reaches the table top
+						const float t = (table.center.y - head.y) / ray.y;
+						const float3 local = RotY(head + ray * t - table.center, -table.yaw);
+						hits += (std::abs(local.x) < halfX + MARGIN && std::abs(local.z) < halfZ + MARGIN);
+					}
+				}
+				return hits;
+			};
+
+			// the first place that keeps the table clear: round from VRSideAngle
+			// to VRSideMaxAngle at the normal height, then the same raised in
+			// steps up to eye level (the rays then pass over the table). If none
+			// is clear, the one that hides the least. Eased, so the panel glides.
+			constexpr float STEP = 10.0f * 0.0174533f;
+			constexpr float LIFT_STEP = 0.15f;
+			const float maxLift = std::max(0.0f, -sideHeight + totalH * 0.5f);
+			float bestAngle = sideAngle;
+			float bestLift = 0.0f;
+			int bestHits = 1 << 30;
+			for (float lift = 0.0f; lift <= maxLift + LIFT_STEP - 1e-3f && bestHits > 0; lift += LIFT_STEP) {
+				const float l = std::min(lift, maxLift);
+				for (float a = sideAngle; a <= sideMaxAngle + 1e-3f; a += STEP) {
+					const int hits = Blocked(Place(a, l));
+					if (hits < bestHits) {
+						bestHits = hits;
+						bestAngle = a;
+						bestLift = l;
+					}
+					if (hits == 0)
+						break;
+				}
+			}
+			if (!sideAngleValid) {
+				sideAngleNow = bestAngle;
+				sideLiftNow = bestLift;
+				sideAngleValid = true;
+			}
+			sideAngleNow += (bestAngle - sideAngleNow) * 0.06f;
+			sideLiftNow += (bestLift - sideLiftNow) * 0.06f;
+
+			const SidePlace place = Place(sideAngleNow, sideLiftNow);
+			const float3 base = place.base;
+			const XrQuaternionf q = place.q;
 			const float3 up = ToF3(Rotate(q, {0.0f, 1.0f, 0.0f}));
 
 			// stacked bottom to top, centred on the anchor height
 			float y = -totalH * 0.5f;
 			for (UIPanelLayer& layer: uiLayers) {
-				if (layer.anchor != VRState::UI_ANCHOR_SIDE)
+				if (layer.anchor != VRState::UI_ANCHOR_SIDE || layer.hidden)
 					continue;
 
 				const float w = layer.w * Scale(layer, sideScale);
@@ -1246,7 +1419,7 @@ void CVRManager::Impl::LayoutUIPanels()
 
 		float totalH = 0.0f;
 		for (const UIPanelLayer& layer: uiLayers) {
-			if (layer.anchor == VRState::UI_ANCHOR_PALETTE)
+			if (layer.anchor == VRState::UI_ANCHOR_PALETTE && !layer.hidden)
 				totalH += layer.h * Scale(layer, paletteScale);
 		}
 
@@ -1275,7 +1448,7 @@ void CVRManager::Impl::LayoutUIPanels()
 
 		float y = LIFT;
 		for (UIPanelLayer& layer: uiLayers) {
-			if (layer.anchor != VRState::UI_ANCHOR_PALETTE)
+			if (layer.anchor != VRState::UI_ANCHOR_PALETTE || layer.hidden)
 				continue;
 
 			const float w = layer.w * Scale(layer, paletteScale);
@@ -1313,7 +1486,7 @@ void CVRManager::Impl::UpdatePointer()
 	// a thumbstick click or A/X on the other hand moves the pointer there, once
 	// the pointer hand holds no mouse button (A/X then also right-clicks, as before)
 	// a thumbstick click on the pointer hand shows or hides the big desktop
-	// panel (menus, chat, settings) while the UI panels are up
+	// panel (menus, chat, settings; shown by default) while the UI panels are up
 	if (pressed[pointerHand][2] && HaveUIPanels()) {
 		tvShown = !tvShown;
 		LOG("[VR] desktop panel %s", tvShown ? "shown" : "hidden");
@@ -1523,14 +1696,9 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 		if (!layer.visible || uiCount >= MAX_UI_LAYERS || !(layer.canvas ? canvasReady : resolved))
 			continue;
 
-		if (layer.sc.handle != XR_NULL_HANDLE && (layer.sc.sizeX != layer.w || layer.sc.sizeY != layer.h)) {
-			xrDestroySwapchain(layer.sc.handle);
-			layer.sc = ColorSwapchain();
-		}
-		if (layer.sc.handle == XR_NULL_HANDLE && !CreateColorSwapchain(layer.w, layer.h, layer.sc)) {
-			layer.sc = ColorSwapchain();
+		// made by EnsureUISwapchains, outside the frame's drawing
+		if (layer.sc.handle == XR_NULL_HANDLE || layer.sc.sizeX != layer.w || layer.sc.sizeY != layer.h)
 			continue;
-		}
 
 		// window rows count down from the top; GL rows count up from the bottom
 		if (!BlitResolvedTo(layer.sc, layer.x, winY - (layer.y + layer.h), layer.w, layer.h, layer.canvas ? canvasFBO : 0))
@@ -1615,6 +1783,7 @@ void CVRManager::Init()
 	impl->sideAngle = configHandler->GetFloat("VRSideAngle") * 0.0174533f;
 	impl->sideDistance = configHandler->GetFloat("VRSideDistance");
 	impl->sideHeight = configHandler->GetFloat("VRSideHeight");
+	impl->sideMaxAngle = std::max(configHandler->GetFloat("VRSideMaxAngle") * 0.0174533f, impl->sideAngle);
 
 	if (impl->CreateInstance() && impl->CreateSession() && impl->CreateSwapchains()) {
 		LOG("[VR] OpenXR session created (stereo=%d, view=%s); waiting for the runtime to start it", impl->stereo, impl->tableView ? "table" : "camera");
@@ -1682,6 +1851,7 @@ void CVRManager::UpdateDesktop()
 	VRPointer::LockDesktopCamera(m.pointerMargin);
 
 	m.SyncUIPanels();
+	m.EnsureUISwapchains();
 
 	if (m.inputReady) {
 		m.LayoutUIPanels();
