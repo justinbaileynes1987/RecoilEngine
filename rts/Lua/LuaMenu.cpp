@@ -2,6 +2,8 @@
 
 #include "LuaMenu.h"
 
+#include <cstring>
+
 #include "LuaInclude.h"
 #include "LuaArchive.h"
 #include "LuaCallInCheck.h"
@@ -147,6 +149,44 @@ string CLuaMenu::LoadFile(const string& name) const
 // RmlUi was set up by LuaMenu (not left over from a game), so LuaMenu shuts it down
 static bool vrMenuStartedRmlUi = false;
 
+// RmlUi's Lua types are registered again in this same Lua state on every
+// visit to the menu. sol2 then drops its reference to each old type storage
+// (registry key "sol.<type>.\xE2\x99\xBB"), and when the garbage collector
+// later finalizes one, the finalizer clears the registry names of the type,
+// which by then belong to the new registration: RmlUi objects made after it
+// stop working (sol: "received nil for 'self' argument", seen 2026-11-26 on
+// the second menu visit). Keeping every old storage referenced means none is
+// ever finalized; a few kB per menu visit.
+static void PinSolUsertypeStorage(lua_State* L)
+{
+	static constexpr const char* PIN_KEY = "zkvr.pinnedSolStorage";
+	static constexpr const char* GC_SUFFIX = ".\xE2\x99\xBB";
+	const size_t suffixLen = strlen(GC_SUFFIX);
+
+	lua_getfield(L, LUA_REGISTRYINDEX, PIN_KEY);
+	if (!lua_istable(L, -1)) {
+		lua_pop(L, 1);
+		lua_newtable(L);
+		lua_pushvalue(L, -1);
+		lua_setfield(L, LUA_REGISTRYINDEX, PIN_KEY);
+	}
+	const int pins = lua_gettop(L);
+	int n = static_cast<int>(lua_objlen(L, pins));
+
+	lua_pushnil(L);
+	while (lua_next(L, LUA_REGISTRYINDEX) != 0) {
+		size_t len = 0;
+		const char* key = (lua_type(L, -2) == LUA_TSTRING) ? lua_tolstring(L, -2, &len) : nullptr;
+		if (key != nullptr && len > suffixLen + 4 && strncmp(key, "sol.", 4) == 0 && strcmp(key + len - suffixLen, GC_SUFFIX) == 0 && lua_isuserdata(L, -1)) {
+			lua_pushvalue(L, -1);
+			lua_rawseti(L, pins, ++n);
+		}
+		lua_pop(L, 1);
+	}
+
+	lua_pop(L, 1); // pins
+}
+
 void CLuaMenu::VRAcquireRmlUi()
 {
 	if (!VRLua::MenuWantsRmlUi() || rmlui || luaUI != nullptr || game != nullptr || !IsValid())
@@ -155,6 +195,7 @@ void CLuaMenu::VRAcquireRmlUi()
 		return; // someone else holds it
 
 	vrMenuStartedRmlUi = true;
+	PinSolUsertypeStorage(L);
 	InitializeRmlUi();
 	if (!rmlui) {
 		LOG_L(L_WARNING, "[VR] LuaMenu could not get RmlUi for the headset menu");
