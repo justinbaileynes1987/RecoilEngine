@@ -173,16 +173,20 @@ static void PinSolUsertypeStorage(lua_State* L)
 	const int pins = lua_gettop(L);
 	int n = static_cast<int>(lua_objlen(L, pins));
 
-	lua_pushnil(L);
-	while (lua_next(L, LUA_REGISTRYINDEX) != 0) {
-		size_t len = 0;
-		const char* key = (lua_type(L, -2) == LUA_TSTRING) ? lua_tolstring(L, -2, &len) : nullptr;
-		if (key != nullptr && len > suffixLen + 4 && strncmp(key, "sol.", 4) == 0 && strcmp(key + len - suffixLen, GC_SUFFIX) == 0 && lua_isuserdata(L, -1)) {
-			lua_pushvalue(L, -1);
-			lua_rawseti(L, pins, ++n);
+	// sol2 keeps them in the globals table (set_field<true>); look in the registry too
+	for (const int where: {LUA_GLOBALSINDEX, LUA_REGISTRYINDEX}) {
+		lua_pushnil(L);
+		while (lua_next(L, where) != 0) {
+			size_t len = 0;
+			const char* key = (lua_type(L, -2) == LUA_TSTRING) ? lua_tolstring(L, -2, &len) : nullptr;
+			if (key != nullptr && len > suffixLen + 4 && strncmp(key, "sol.", 4) == 0 && strcmp(key + len - suffixLen, GC_SUFFIX) == 0 && lua_isuserdata(L, -1)) {
+				lua_pushvalue(L, -1);
+				lua_rawseti(L, pins, ++n);
+			}
+			lua_pop(L, 1);
 		}
-		lua_pop(L, 1);
 	}
+	LOG_L(L_DEBUG, "[VR] LuaMenu: %d sol2 type storages kept", n);
 
 	lua_pop(L, 1); // pins
 }
