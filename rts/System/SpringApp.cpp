@@ -107,6 +107,7 @@
 #include "lib/luasocket/src/restrictions.h"
 
 #ifdef ENABLE_OPENXR
+#include "Lua/LuaMenu.h"
 #include "Rendering/VR/VRManager.h"
 #endif
 
@@ -767,6 +768,12 @@ void SpringApp::Reload(const std::string script)
 {
 	LOG("[SpringApp::%s][1]", __func__);
 
+	#ifdef ENABLE_OPENXR
+	// Zero-K VR: LuaMenu gives RmlUi back before the next game's LuaUI sets it
+	// up (possibly on the loading thread); it takes it again in ActivateMenu
+	CLuaMenu::VRReleaseRmlUiIfHeld();
+	#endif
+
 	// get rid of any running worker threads
 	ThreadPool::SetThreadCount(0);
 	ThreadPool::SetDefaultThreadCount();
@@ -1023,6 +1030,8 @@ void SpringApp::Kill(bool fromRun)
 
 	#ifdef ENABLE_OPENXR
 	CVRManager::GetInstance().Kill();
+	// RmlUi is shut down while its interfaces and LuaMenu still live
+	CLuaMenu::VRReleaseRmlUiIfHeld();
 	#endif
 
 	ThreadPool::SetThreadCount(0);

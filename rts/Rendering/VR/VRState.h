@@ -127,4 +127,15 @@ namespace VRState {
 	};
 	inline std::vector<UIPanelRequest> uiPanels;
 	inline int uiPanelsVersion = 0;
+
+	// the same, asked for by LuaMenu (the lobby). LuaMenu lives through every
+	// game, so its panels are kept apart: the headset shows LuaMenu's while no
+	// game runs (menuView) and LuaUI's in a game.
+	inline std::vector<UIPanelRequest> menuPanels;
+	inline int menuPanelsVersion = 0;
+
+	// set by CVRManager each frame: an OpenXR session is running, and no game
+	// is the active controller (the menu, the loading screen, pregame)
+	inline bool sessionRunning = false;
+	inline bool menuView = false;
 }

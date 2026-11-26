@@ -15,6 +15,12 @@
 namespace VRPointer {
 	// true while a game is running (the pointer and camera lock only apply then)
 	bool InGame();
+	// true while the lobby (LuaMenu) is the active controller: the pointer
+	// drives the desktop panel (TV) only, there is no world to pick
+	bool InMenu();
+	// true unless a game is the active controller: the menu, and the loading
+	// screen and pregame of a game (LuaMenu's headset panels apply then)
+	bool InMenuView();
 
 	// points the player camera straight down at the map centre, high enough
 	// that the map fills the middle of the window; margin > 1 leaves that much
@@ -57,4 +63,8 @@ namespace VRPointer {
 
 	// let go of any button the pointer is holding down, and of Shift
 	void Release();
+
+	// mouse-wheel steps at the cursor (thumbstick scrolling on the desktop
+	// panel); positive scrolls up, as a wheel turned away from you
+	void Scroll(float delta);
 }

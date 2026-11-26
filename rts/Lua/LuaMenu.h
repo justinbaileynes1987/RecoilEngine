@@ -51,6 +51,15 @@ public:
 
 	static int SendLuaUIMsg(lua_State* L);
 
+#ifdef ENABLE_OPENXR
+	// Zero-K VR: LuaMenu holds RmlUi while no game runs, for the headset menu
+	// (RmlUi serves one Lua state at a time). Taken in ActivateMenu, given back
+	// at the start of every SpringApp::Reload (main thread, before the next
+	// game's LuaUI sets RmlUi up) and on exit. See VRLua.h.
+	void VRAcquireRmlUi();
+	static void VRReleaseRmlUiIfHeld();
+#endif
+
 protected:
 	CLuaMenu();
 	virtual ~CLuaMenu();

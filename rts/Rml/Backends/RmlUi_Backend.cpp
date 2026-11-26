@@ -690,4 +690,21 @@ void VRRml::PointerLeave()
 		context->ProcessMouseLeave();
 	}
 }
+
+bool VRRml::PointerWheel(float delta)
+{
+	if (!HaveContexts())
+		return false;
+
+	bool handled = false;
+	for (const auto& context : state->vr_contexts) {
+		handled |= !context->ProcessMouseWheel(Rml::Vector2f(0.0f, delta), 0);
+	}
+	return handled;
+}
+
+void VRRml::Update()
+{
+	RmlGui::Update();
+}
 #endif

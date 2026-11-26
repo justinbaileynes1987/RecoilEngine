@@ -214,6 +214,10 @@ namespace {
 
 	constexpr float MIN_TABLE_SIZE = 0.2f;   // metres
 	constexpr float MAX_TABLE_SIZE = 200.0f; // metres; large enough to stand inside a base
+
+	// half the side of the empty table in the menu (metres): the game table's
+	// size, kept within what reads as a table
+	float MenuTableHalf(const TablePose& tp) { return std::clamp(tp.size, 0.6f, 2.0f) * 0.5f; }
 }
 
 
@@ -294,7 +298,23 @@ struct CVRManager::Impl
 	bool commandClick[CVRInput::NUM_HANDS] = {};      // A/X held as the right button
 	int pointerHit = 0;            // this frame: 0 nothing, 1 world, 2 panel
 	float3 pointerHitPos;          // world position of the hit (on the panel: mapped into the world)
+	float3 pointerHitXR;           // the same in LOCAL space (on a panel only)
+	float scrollSteps = 0.0f;      // menu: thumbstick scrolling, wheel steps not yet sent
 	void UpdatePointer();
+
+	// the menu (no game is the active controller): the war room is drawn by
+	// DrawMenuRoom straight into the eye swapchains, so the TV hangs on its
+	// wall and the panels stand round an empty table, as in a game
+	bool menuView = false;
+	bool inLobby = false;          // LuaMenu is the active controller (not loading)
+	bool roomDrawn = false;        // this frame
+	void UpdateMenu();
+	void DrawMenuRoom();
+	// the TV's last submitted placement, to show it again on a frame that has
+	// no new desktop image (the menu draws a few times a second when idle)
+	bool tvSubmitted = false;
+	XrPosef tvPose = {{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+	XrExtent2Df tvSize = {0.0f, 0.0f};
 
 	// where the desktop panel floats (LOCAL space): its centre and size in metres
 	void PanelRect(bool behindTable, float3& center, float& width, float& height) const;
@@ -320,6 +340,7 @@ struct CVRManager::Impl
 	int swapchainFailures = 0;    // in a row; retries are spaced out
 	int swapchainRetryIn = 0;     // frames until the next try after a failure
 	int uiPanelsVersionSeen = -1;
+	bool uiPanelsMenuSeen = false; // uiLayers came from LuaMenu's list (VRState::menuPanels)
 	bool uiPanelsEnabled = true;  // VRUIPanels
 	std::string lastPanelLogged;  // pointer log: the panel last reported under the pointer
 	bool paletteShown = false;    // the off-hand palette is up (hand raised, with hysteresis)
@@ -391,6 +412,8 @@ struct CVRManager::Impl
 	}
 	// clear eye i's overlay image to transparent and run draw into it
 	bool DrawOverlay(uint32_t eye, const std::function<void()>& draw);
+	// clear the next image of a swapchain to a colour and run draw into it
+	bool DrawInto(ColorSwapchain& sc, const float clear[4], const std::function<void()>& draw, const char* what);
 	bool PrimeSwapchain(ColorSwapchain& sc);
 	void SubmitFrame(bool haveFrame);
 };
@@ -963,14 +986,24 @@ bool CVRManager::Impl::DrawOverlay(uint32_t eye, const std::function<void()>& dr
 	if (!overlayOK || sc.handle == XR_NULL_HANDLE)
 		return false;
 
+	const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	return DrawInto(sc, clear, draw, "overlay");
+}
+
+
+bool CVRManager::Impl::DrawInto(ColorSwapchain& sc, const float clear[4], const std::function<void()>& draw, const char* what)
+{
+	if (sc.handle == XR_NULL_HANDLE)
+		return false;
+
 	uint32_t imageIndex = 0;
 	XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-	if (!Check(xrAcquireSwapchainImage(sc.handle, &acquireInfo, &imageIndex), "xrAcquireSwapchainImage (overlay)"))
+	if (!Check(xrAcquireSwapchainImage(sc.handle, &acquireInfo, &imageIndex), what))
 		return false;
 
 	XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
 	waitInfo.timeout = XR_INFINITE_DURATION;
-	if (!Check(xrWaitSwapchainImage(sc.handle, &waitInfo), "xrWaitSwapchainImage (overlay)"))
+	if (!Check(xrWaitSwapchainImage(sc.handle, &waitInfo), what))
 		return false;
 
 	{
@@ -983,7 +1016,7 @@ bool CVRManager::Impl::DrawOverlay(uint32_t eye, const std::function<void()>& dr
 		glBindFramebuffer(GL_FRAMEBUFFER, blitFBO);
 		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sc.images[imageIndex].image, 0);
 		glViewport(0, 0, sc.sizeX, sc.sizeY);
-		glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+		glClearColor(clear[0], clear[1], clear[2], clear[3]);
 		glClear(GL_COLOR_BUFFER_BIT);
 
 		draw();
@@ -994,7 +1027,7 @@ bool CVRManager::Impl::DrawOverlay(uint32_t eye, const std::function<void()>& dr
 	}
 
 	XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-	const bool ok = Check(xrReleaseSwapchainImage(sc.handle, &releaseInfo), "xrReleaseSwapchainImage (overlay)");
+	const bool ok = Check(xrReleaseSwapchainImage(sc.handle, &releaseInfo), what);
 	sc.released |= ok;
 	return ok;
 }
@@ -1071,7 +1104,9 @@ void CVRManager::Impl::UpdateTable()
 			const float3 span = rightPos - leftPos;
 			const float3 mid = (leftPos + rightPos) * 0.5f;
 
-			const float newSize = std::clamp(grabStart.size * (span.Length() / grabDist0), MIN_TABLE_SIZE, MAX_TABLE_SIZE);
+			// in the menu the table is an empty slab: turning and moving it is
+			// kept for the next game, zooming (the map's scale) is not offered
+			const float newSize = menuView ? grabStart.size : std::clamp(grabStart.size * (span.Length() / grabDist0), MIN_TABLE_SIZE, MAX_TABLE_SIZE);
 			const float zoom = newSize / grabStart.size;
 			const float turn = WrapAngle(YawOf(span) - grabYaw0);
 
@@ -1126,10 +1161,15 @@ void CVRManager::Impl::PanelRect(bool behindTable, float3& center, float& width,
 // (by name) until its pixel size changes, which SubmitFrame handles
 void CVRManager::Impl::SyncUIPanels()
 {
-	if (uiPanelsVersionSeen == VRState::uiPanelsVersion)
+	// LuaMenu's panels while no game runs, LuaUI's in a game
+	const std::vector<VRState::UIPanelRequest>& requests = menuView ? VRState::menuPanels : VRState::uiPanels;
+	const int version = menuView ? VRState::menuPanelsVersion : VRState::uiPanelsVersion;
+
+	if (uiPanelsVersionSeen == version && uiPanelsMenuSeen == menuView)
 		return;
 
-	uiPanelsVersionSeen = VRState::uiPanelsVersion;
+	uiPanelsVersionSeen = version;
+	uiPanelsMenuSeen = menuView;
 
 	const int winX = globalRendering->winSizeX;
 	const int winY = globalRendering->winSizeY;
@@ -1137,7 +1177,7 @@ void CVRManager::Impl::SyncUIPanels()
 	std::vector<UIPanelLayer> next;
 	std::string summary;
 
-	for (const VRState::UIPanelRequest& req: VRState::uiPanels) {
+	for (const VRState::UIPanelRequest& req: requests) {
 		// clamp to the window
 		const int x0 = std::clamp(req.x, 0, winX);
 		const int y0 = std::clamp(req.y, 0, winY);
@@ -1191,7 +1231,7 @@ void CVRManager::Impl::SyncUIPanels()
 
 	static bool loggedFirst = false;
 	if (!loggedFirst && !uiLayers.empty()) {
-		LOG("[VR] UI panels from LuaUI:%s (pointer-hand thumbstick click hides or shows the big desktop panel)", summary.c_str());
+		LOG("[VR] UI panels from %s:%s (pointer-hand thumbstick click hides or shows the big desktop panel)", menuView ? "LuaMenu" : "LuaUI", summary.c_str());
 		loggedFirst = true;
 	}
 }
@@ -1293,8 +1333,9 @@ void CVRManager::Impl::LayoutUIPanels()
 	const float mapX = static_cast<float>(mapDims.mapx * SQUARE_SIZE);
 	const float mapZ = static_cast<float>(mapDims.mapy * SQUARE_SIZE);
 	const float mapMax = std::max(std::max(mapX, mapZ), 1.0f);
-	const float halfX = table.size * mapX / mapMax * 0.5f;
-	const float halfZ = table.size * mapZ / mapMax * 0.5f;
+	// in the menu: the empty square slab DrawMenuRoom draws
+	const float halfX = menuView ? MenuTableHalf(table) : table.size * mapX / mapMax * 0.5f;
+	const float halfZ = menuView ? MenuTableHalf(table) : table.size * mapZ / mapMax * 0.5f;
 
 	// the bar
 	{
@@ -1669,9 +1710,29 @@ void CVRManager::Impl::UpdatePointer()
 		shift |= (triggerRole[h] == TRIGGER_SHIFT);
 	}
 
-	VRPointer::SetShift(shift);
+	// the lobby has no orders to queue
+	VRPointer::SetShift(shift && !menuView);
 
 	const VRHandState& hand = input.Hand(pointerHand);
+
+	// menu only: the pointer hand's thumbstick scrolls what the pointer is on
+	// (lists in the lobby), in mouse-wheel steps: up to ~12 a second, stick
+	// pushed away from you scrolls up
+	int wheel = 0;
+	if (menuView) {
+		constexpr float DEADZONE = 0.3f;
+		constexpr float STEPS_PER_SECOND = 12.0f;
+		const float y = hand.thumbstick.y;
+		const float dt = std::clamp(static_cast<float>(frameState.predictedDisplayPeriod) * 1e-9f, 0.001f, 0.05f);
+		if (std::abs(y) > DEADZONE) {
+			const float push = (std::abs(y) - DEADZONE) / (1.0f - DEADZONE);
+			scrollSteps += std::copysign(push * STEPS_PER_SECOND * dt, y);
+		} else {
+			scrollSteps = 0.0f;
+		}
+		wheel = static_cast<int>(scrollSteps);
+		scrollSteps -= static_cast<float>(wheel);
+	}
 	VRPointer::Input in;
 	in.left = (triggerRole[pointerHand] == TRIGGER_CLICK);
 	in.right = commandClick[pointerHand];
@@ -1773,6 +1834,10 @@ void CVRManager::Impl::UpdatePointer()
 		if (onCanvas) {
 			pointerHit = 2;
 			pointerHitPos = m.Pos(panelHitXR);
+			pointerHitXR = ToF3(panelHitXR);
+			// RmlUi wheel steps: positive scrolls down
+			if (wheel != 0)
+				VRRml::PointerWheel(static_cast<float>(-wheel));
 		}
 		return;
 	}
@@ -1793,6 +1858,9 @@ void CVRManager::Impl::UpdatePointer()
 	if (in.onPanel && panelT > 0.0f) {
 		pointerHit = 2;
 		pointerHitPos = m.Pos(panelHitXR);
+		pointerHitXR = ToF3(panelHitXR);
+		if (wheel != 0)
+			VRPointer::Scroll(static_cast<float>(wheel));
 	} else if (result.worldHit) {
 		pointerHit = 1;
 		pointerHitPos = result.pos;
@@ -1812,7 +1880,10 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 	XrCompositionLayerProjection overlayLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
 	uint32_t layerCount = 0;
 
-	if (frameState.shouldRender && eyesDrawn) {
+	// the eye images: the game's world (DrawEyes) or the menu's war room (DrawMenuRoom)
+	const bool eyeImages = eyesDrawn || roomDrawn;
+
+	if (frameState.shouldRender && eyeImages) {
 		for (uint32_t i = 0; i < NUM_EYES; ++i) {
 			projViews[i] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
 			projViews[i].pose = views[i].pose;
@@ -1831,11 +1902,15 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 
 	const int winX = globalRendering->winSizeX;
 	const int winY = globalRendering->winSizeY;
-	const bool inGameView = eyesDrawn && tableView;
+	// the table view with a room round it (a game, or the menu's war room):
+	// the TV hangs on the wall and the UI panels show
+	const bool inGameView = eyeImages && tableView;
 	const bool anyUI = inGameView && std::any_of(uiLayers.begin(), uiLayers.end(), [](const UIPanelLayer& l) { return l.visible && !l.canvas; });
 	const bool anyCanvas = inGameView && std::any_of(uiLayers.begin(), uiLayers.end(), [](const UIPanelLayer& l) { return l.visible && l.canvas; });
 	const bool resolved = frameState.shouldRender && haveFrame && (TVVisible(inGameView) || anyUI) && ResolveBackBuffer(0, 0, winX, winY);
-	const bool canvasReady = frameState.shouldRender && haveFrame && anyCanvas && RenderCanvas(winX, winY);
+	// the canvas is drawn here, not by the desktop frame, so it is fresh every
+	// frame (the menu leaves out desktop frames while idle)
+	const bool canvasReady = frameState.shouldRender && anyCanvas && RenderCanvas(winX, winY);
 
 	// SteamVR shows a quad layer that changes swapchain between frames (in the
 	// same place of the layer list) cropped and stretched to the previous
@@ -1852,7 +1927,11 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 	};
 
 	const bool tvOn = resolved && TVVisible(inGameView) && BlitResolvedTo(mirror, 0, 0, winX, winY);
-	if (tvOn || (frameState.shouldRender && inGameView && PrimeSwapchain(mirror))) {
+	// no new desktop frame (Chobby's FPS limit skips draws when idle): show
+	// the last image again where it was, rather than an empty frame, which
+	// SteamVR answers by taking the headset's focus away (seen 2026-11-26)
+	const bool tvHeld = !tvOn && !haveFrame && frameState.shouldRender && tvSubmitted && mirror.released && TVVisible(inGameView);
+	if (tvOn || tvHeld || (frameState.shouldRender && inGameView && PrimeSwapchain(mirror))) {
 		panel.space = localSpace;
 		panel.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
 		panel.subImage.swapchain = mirror.handle;
@@ -1862,24 +1941,38 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 
 		if (tvOn) {
 			float3 center;
-			PanelRect(eyesDrawn && tableView, center, panel.size.width, panel.size.height);
+			PanelRect(inGameView, center, panel.size.width, panel.size.height);
 			panel.pose.orientation.w = 1.0f;
 			panel.pose.position = {center.x, center.y, center.z};
+			tvPose = panel.pose;
+			tvSize = panel.size;
+		} else if (tvHeld) {
+			panel.pose = tvPose;
+			panel.size = tvSize;
 		} else {
 			Park(panel);
 		}
 
 		layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&panel);
 	}
+	if (frameState.shouldRender)
+		tvSubmitted = tvOn || tvHeld;
 
 	// the UI panels, each from its own swapchain sized like its window
 	// rectangle (recreated when that size changes), so the whole image is
 	// used and no sub-image origin convention is involved
 	// a panel the pointer can hit must be one the headset shows (a panel left
 	// out below, say for want of a swapchain, would stop the pointer in mid-air)
-	if (frameState.shouldRender && haveFrame) {
-		for (UIPanelLayer& layer: uiLayers)
+	// without a new desktop frame, a desktop panel shown last frame shows its
+	// last image again (as the TV does); canvas panels are always fresh
+	bool heldUI[MAX_UI_LAYERS] = {};
+	if (frameState.shouldRender) {
+		int i = 0;
+		for (UIPanelLayer& layer: uiLayers) {
+			if (i < MAX_UI_LAYERS)
+				heldUI[i++] = !haveFrame && !layer.canvas && layer.drawn && layer.sc.released;
 			layer.drawn = false;
+		}
 	}
 
 	int uiCount = 0;
@@ -1892,8 +1985,10 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 			continue;
 
 		// window rows count down from the top; GL rows count up from the bottom
-		const bool show = layer.visible && (layer.canvas ? canvasReady : resolved) &&
-			BlitResolvedTo(layer.sc, layer.x, winY - (layer.y + layer.h), layer.w, layer.h, layer.canvas ? canvasFBO : 0);
+		const size_t index = static_cast<size_t>(&layer - uiLayers.data());
+		const bool held = layer.visible && index < MAX_UI_LAYERS && heldUI[index];
+		const bool show = held || (layer.visible && (layer.canvas ? canvasReady : resolved) &&
+			BlitResolvedTo(layer.sc, layer.x, winY - (layer.y + layer.h), layer.w, layer.h, layer.canvas ? canvasFBO : 0));
 
 		if (!show) {
 			if (!PrimeSwapchain(layer.sc))
@@ -1933,7 +2028,7 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 	}
 
 	// the pointer rays, over every panel
-	if (frameState.shouldRender && eyesDrawn && overlayDrawn) {
+	if (frameState.shouldRender && eyeImages && overlayDrawn) {
 		for (uint32_t i = 0; i < NUM_EYES; ++i) {
 			overlayViews[i] = projViews[i];
 			overlayViews[i].subImage.swapchain = overlay[i].handle;
@@ -2034,6 +2129,11 @@ void CVRManager::BeginFrame()
 
 	impl->PollEvents();
 
+	VRState::sessionRunning = impl->running;
+	impl->menuView = VRPointer::InMenuView();
+	impl->inLobby = VRPointer::InMenu();
+	VRState::menuView = impl->menuView;
+
 	if (!impl->running || impl->frameBegun)
 		return;
 
@@ -2059,6 +2159,51 @@ void CVRManager::BeginFrame()
 		impl->input.Update(impl->session, impl->localSpace, impl->frameState.predictedDisplayTime);
 		impl->UpdateTable();
 	}
+
+	impl->UpdateMenu();
+}
+
+
+// the lobby (LuaMenu active): its headset panels, the pointer on them and on
+// the TV, and RmlUi (which only the game updates otherwise). The game does
+// the same in UpdateDesktop.
+void CVRManager::Impl::UpdateMenu()
+{
+	static bool lobbyPointer = false;
+
+	if (inLobby)
+		VRRml::Update();
+
+	if (!inLobby || !tableView || !pointerEnabled || !inputReady) {
+		if (menuView) {
+			HideUIPanels();
+			pointerHit = 0;
+		}
+		if (lobbyPointer) {
+			// leaving the lobby (a game loads): let go of everything held
+			VRPointer::Release();
+			if (uiHover)
+				VRRml::PointerLeave();
+			uiButtons[0] = uiButtons[1] = false;
+			uiHover = false;
+			worldHeld = false;
+			lobbyPointer = false;
+		}
+		return;
+	}
+
+	if (!lobbyPointer) {
+		// coming from a game: nothing it held carries over
+		uiButtons[0] = uiButtons[1] = false;
+		uiHover = false;
+		worldHeld = false;
+		lobbyPointer = true;
+	}
+
+	SyncUIPanels();
+	EnsureUISwapchains();
+	LayoutUIPanels();
+	UpdatePointer();
 }
 
 
@@ -2066,7 +2211,7 @@ void CVRManager::UpdateDesktop()
 {
 	Impl& m = *impl;
 
-	if (!m.running || !m.tableView || !m.pointerEnabled || !VRPointer::InGame()) {
+	if (!m.running || !m.tableView || !m.pointerEnabled || !VRPointer::InGame() || m.menuView) {
 		m.pointerHit = 0;
 		m.HideUIPanels();
 		VRPointer::Release();
@@ -2168,7 +2313,7 @@ struct HandVisual {
 };
 
 // raysOnly: just the pointer rays and their end markers (the overlay over the UI panels)
-static void DrawHands(const CCamera* cam, const HandVisual* hands, int numHands, const std::vector<float3>& selectionOutline, float lift, bool raysOnly = false)
+static void DrawHands(const float* projMat, const float* viewMat, const HandVisual* hands, int numHands, const std::vector<float3>& selectionOutline, float lift, bool raysOnly = false)
 {
 	auto& rb = RenderBuffer::GetTypedRenderBuffer<VA_TYPE_C>();
 
@@ -2214,8 +2359,8 @@ static void DrawHands(const CCamera* cam, const HandVisual* hands, int numHands,
 
 	auto& shader = rb.GetShader();
 
-	glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadMatrixf(cam->GetProjectionMatrix());
-	glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadMatrixf(cam->GetViewMatrix());
+	glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadMatrixf(projMat);
+	glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadMatrixf(viewMat);
 
 	// always visible: the pointer must show even where terrain is in the way
 	glDisable(GL_DEPTH_TEST);
@@ -2439,7 +2584,7 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 			DrawGreyboxRoom(cam, xrToWorld, scale, impl->tableHeight, impl->tableDistance);
 		}
 		if (impl->inputReady)
-			DrawHands(cam, handVisuals, CVRInput::NUM_HANDS, selectionOutline, 0.002f * scale);
+			DrawHands(cam->GetProjectionMatrix(), cam->GetViewMatrix(), handVisuals, CVRInput::NUM_HANDS, selectionOutline, 0.002f * scale);
 
 		if (logThisFrame) {
 			const float3 p = cam->GetPos();
@@ -2456,7 +2601,7 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 		// the pointer rays again, on a transparent layer submitted over the UI panels
 		if (ok && impl->inputReady && impl->tableView) {
 			const std::vector<float3> noOutline;
-			overlayCount += impl->DrawOverlay(i, [&]() { DrawHands(cam, handVisuals, CVRInput::NUM_HANDS, noOutline, 0.0f, true); }) ? 1 : 0;
+			overlayCount += impl->DrawOverlay(i, [&]() { DrawHands(cam->GetProjectionMatrix(), cam->GetViewMatrix(), handVisuals, CVRInput::NUM_HANDS, noOutline, 0.0f, true); }) ? 1 : 0;
 		}
 	}
 
@@ -2485,14 +2630,187 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 }
 
 
+// the empty war room for the menu, in OpenXR LOCAL space (metres): the floor
+// and its grid and the table slab (where the next game's map will lie), as
+// DrawGreyboxRoom shows them in a game
+static void DrawMenuRoomGeometry(const float* projMat, const float* viewMat, const float3& tableCenter, float tableYaw, float tableHalf, float floorY)
+{
+	const SColor topCol(58, 56, 52, 255);
+	const SColor sideCol(40, 38, 35, 255);
+	const SColor floorCol(28, 29, 31, 255);
+	const SColor gridCol(70, 74, 80, 255);
+
+	auto& rb = RenderBuffer::GetTypedRenderBuffer<VA_TYPE_C>();
+	auto& shader = rb.GetShader();
+
+	glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadMatrixf(projMat);
+	glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadMatrixf(viewMat);
+
+	// no depth buffer: drawn back to front (floor, grid, table sides, table top)
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_BLEND);
+	glDisable(GL_CULL_FACE);
+
+	shader.Enable();
+
+	// floor 8 x 8 m round the starting position
+	rb.AddQuadTriangles({{-4.0f, floorY, -4.0f}, floorCol}, {{4.0f, floorY, -4.0f}, floorCol}, {{4.0f, floorY, 4.0f}, floorCol}, {{-4.0f, floorY, 4.0f}, floorCol});
+	rb.DrawElements(GL_TRIANGLES);
+
+	// grid lines every 0.5 m
+	for (int i = -8; i <= 8; ++i) {
+		const float d = i * 0.5f;
+		rb.AddVertex({{d, floorY, -4.0f}, gridCol}); rb.AddVertex({{d, floorY, 4.0f}, gridCol});
+		rb.AddVertex({{-4.0f, floorY, d}, gridCol}); rb.AddVertex({{4.0f, floorY, d}, gridCol});
+	}
+	rb.DrawArrays(GL_LINES);
+
+	// the table slab: its top just under sea level of the map that will lie on it
+	const float h = tableHalf + 0.03f;
+	const float topY = tableCenter.y - 0.002f;
+	const float botY = topY - 0.04f;
+	const float corners[4][2] = {{-h, -h}, {h, -h}, {h, h}, {-h, h}};
+	float3 c[4];
+	for (int k = 0; k < 4; ++k)
+		c[k] = tableCenter + RotY(float3(corners[k][0], 0.0f, corners[k][1]), tableYaw);
+
+	for (int k = 0; k < 4; ++k) {
+		const float3& a = c[k];
+		const float3& b = c[(k + 1) % 4];
+		rb.AddQuadTriangles({{a.x, topY, a.z}, sideCol}, {{b.x, topY, b.z}, sideCol}, {{b.x, botY, b.z}, sideCol}, {{a.x, botY, a.z}, sideCol});
+	}
+	rb.AddQuadTriangles({{c[0].x, topY, c[0].z}, topCol}, {{c[1].x, topY, c[1].z}, topCol}, {{c[2].x, topY, c[2].z}, topCol}, {{c[3].x, topY, c[3].z}, topCol});
+	rb.DrawElements(GL_TRIANGLES);
+
+	shader.Disable();
+
+	glMatrixMode(GL_PROJECTION); glPopMatrix();
+	glMatrixMode(GL_MODELVIEW);  glPopMatrix();
+}
+
+
+void CVRManager::Impl::DrawMenuRoom()
+{
+	roomDrawn = false;
+	overlayDrawn = false;
+
+	// the controllers, in LOCAL space
+	HandVisual hands[CVRInput::NUM_HANDS];
+	if (inputReady) {
+		for (int h = 0; h < CVRInput::NUM_HANDS; ++h) {
+			const VRHandState& hand = input.Hand(h);
+			HandVisual& hv = hands[h];
+
+			if ((hv.gripValid = hand.gripValid)) {
+				hv.gripPos = ToF3(hand.grip.position);
+				hv.gripAxes[0] = ToF3(Rotate(hand.grip.orientation, {0.04f, 0.0f, 0.0f}));
+				hv.gripAxes[1] = ToF3(Rotate(hand.grip.orientation, {0.0f, 0.04f, 0.0f}));
+				hv.gripAxes[2] = ToF3(Rotate(hand.grip.orientation, {0.0f, 0.0f, 0.04f}));
+				hv.held = ((grabMask >> h) & 1) != 0;
+			}
+
+			if ((hv.aimValid = (hand.aimValid && pointerEnabled))) {
+				const float3 dir = ToF3(Rotate(hand.aim.orientation, {0.0f, 0.0f, -1.0f}));
+				hv.rayFrom = ToF3(hand.aim.position);
+				hv.rayHit = false;
+
+				if (h == pointerHand) {
+					const bool clicking = (triggerRole[h] == TRIGGER_CLICK) || commandClick[h];
+					hv.rayCol = clicking ? SColor(255, 160, 40, 255) : SColor(220, 225, 235, 255);
+					// ends on the panel it points at, otherwise a metre long
+					hv.rayTo = (pointerHit == 2) ? pointerHitXR : hv.rayFrom + dir * 1.0f;
+				} else {
+					hv.rayCol = SColor(110, 115, 125, 255);
+					hv.rayTo = hv.rayFrom + dir * 0.4f;
+				}
+			}
+		}
+	}
+
+	// GL state the menu's own drawing expects back afterwards
+	const GLboolean prevDepth = glIsEnabled(GL_DEPTH_TEST);
+	const GLboolean prevBlend = glIsEnabled(GL_BLEND);
+	const GLboolean prevCull = glIsEnabled(GL_CULL_FACE);
+
+	const std::vector<float3> noOutline;
+	const float roomClear[4] = {0.07f, 0.075f, 0.08f, 1.0f};
+	const float tableHalf = MenuTableHalf(table);
+	const float floorY = tableHeight - 0.75f;
+
+	bool ok = true;
+	uint32_t overlayCount = 0;
+
+	for (uint32_t i = 0; i < NUM_EYES && ok; ++i) {
+		const XrPosef& pose = views[i].pose;
+		const XrFovf& fov = views[i].fov;
+
+		// off-axis projection from the eye's field of view (column-major)
+		constexpr float N = 0.05f;
+		constexpr float F = 100.0f;
+		const float l = std::tan(fov.angleLeft) * N;
+		const float r = std::tan(fov.angleRight) * N;
+		const float b = std::tan(fov.angleDown) * N;
+		const float t = std::tan(fov.angleUp) * N;
+		const float proj[16] = {
+			2.0f * N / (r - l), 0.0f, 0.0f, 0.0f,
+			0.0f, 2.0f * N / (t - b), 0.0f, 0.0f,
+			(r + l) / (r - l), (t + b) / (t - b), -(F + N) / (F - N), -1.0f,
+			0.0f, 0.0f, -2.0f * F * N / (F - N), 0.0f,
+		};
+
+		// the inverse of the eye's pose (column-major): its axes are the rows
+		const float3 ex = ToF3(Rotate(pose.orientation, {1.0f, 0.0f, 0.0f}));
+		const float3 ey = ToF3(Rotate(pose.orientation, {0.0f, 1.0f, 0.0f}));
+		const float3 ez = ToF3(Rotate(pose.orientation, {0.0f, 0.0f, 1.0f}));
+		const float3 ep = ToF3(pose.position);
+		const float view[16] = {
+			ex.x, ey.x, ez.x, 0.0f,
+			ex.y, ey.y, ez.y, 0.0f,
+			ex.z, ey.z, ez.z, 0.0f,
+			-ex.dot(ep), -ey.dot(ep), -ez.dot(ep), 1.0f,
+		};
+
+		ok = DrawInto(eyes[i], roomClear, [&]() {
+			DrawMenuRoomGeometry(proj, view, table.center, table.yaw, tableHalf, floorY);
+			if (inputReady)
+				DrawHands(proj, view, hands, CVRInput::NUM_HANDS, noOutline, 0.0f);
+		}, "menu room");
+
+		// the rays again, over the panels
+		if (ok && inputReady)
+			overlayCount += DrawOverlay(i, [&]() { DrawHands(proj, view, hands, CVRInput::NUM_HANDS, noOutline, 0.0f, true); }) ? 1 : 0;
+	}
+
+	if (prevDepth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+	if (prevBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+	if (prevCull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+
+	static bool loggedFirst = false;
+	if (ok && !loggedFirst) {
+		LOG("[VR] drawing the war room in the menu (table %.2f m across)", tableHalf * 2.0f);
+		loggedFirst = true;
+	}
+
+	roomDrawn = ok;
+	overlayDrawn = (overlayCount == NUM_EYES);
+}
+
+
 void CVRManager::EndOfFrame(bool haveFrame)
 {
 	if (impl->instance == XR_NULL_HANDLE || !impl->frameBegun)
 		return;
 
+	// the lobby draws no world: draw the empty war room here, so the headset
+	// shows a room round the TV rather than the TV floating in the dark
+	impl->roomDrawn = false;
+	if (impl->inLobby && impl->stereo && impl->tableView && !impl->eyesDrawn && impl->frameState.shouldRender && impl->viewsValid)
+		impl->DrawMenuRoom();
+
 	impl->SubmitFrame(haveFrame);
 	impl->frameBegun = false;
 	impl->eyesDrawn = false;
+	impl->roomDrawn = false;
 }
 
 

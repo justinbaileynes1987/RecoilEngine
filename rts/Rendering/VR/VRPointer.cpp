@@ -19,6 +19,7 @@
 #include "Game/UI/MouseHandler.h"
 #include "Game/UI/ScanCodes.h"
 #include "Map/Ground.h"
+#include "Menu/LuaMenuController.h"
 #include "Rendering/VR/VRState.h"
 #include "Sim/Features/Feature.h"
 #include "Sim/Features/FeatureDef.h"
@@ -118,6 +119,27 @@ namespace {
 bool VRPointer::InGame()
 {
 	return (game != nullptr && mouse != nullptr && readMap != nullptr);
+}
+
+
+bool VRPointer::InMenu()
+{
+	return (mouse != nullptr && luaMenuController != nullptr && activeController == luaMenuController);
+}
+
+
+bool VRPointer::InMenuView()
+{
+	return (game == nullptr || activeController != game);
+}
+
+
+void VRPointer::Scroll(float delta)
+{
+	if (mouse == nullptr || yielded || lastX < 0 || delta == 0.0f)
+		return;
+
+	mouse->MouseWheel(delta);
 }
 
 
@@ -255,7 +277,8 @@ VRPointer::Result VRPointer::Update(const Input& in)
 {
 	Result result;
 
-	if (!InGame()) {
+	const bool inGame = InGame();
+	if (!inGame && !InMenu()) {
 		Release();
 		return result;
 	}
@@ -280,7 +303,7 @@ VRPointer::Result VRPointer::Update(const Input& in)
 		haveTarget = true;
 		px = in.panelX;
 		py = in.panelY;
-	} else if (in.rayValid) {
+	} else if (in.rayValid && inGame) {
 		const CUnit* hitUnit = nullptr;
 		const CFeature* hitFeature = nullptr;
 

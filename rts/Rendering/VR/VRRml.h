@@ -27,4 +27,10 @@ namespace VRRml {
 	bool PointerButton(int button, bool down);
 	// the pointer left every VR panel
 	void PointerLeave();
+	// thumbstick scrolling over a VR panel, in mouse-wheel steps (positive: down)
+	bool PointerWheel(float delta);
+
+	// updates every RmlUi context; the game does this itself, so call it only
+	// while no game runs (LuaMenu's headset menu)
+	void Update();
 }

@@ -28,6 +28,12 @@
 
 #include "System/Misc/TracyDefs.h"
 
+#ifdef ENABLE_OPENXR
+#include "Game/Game.h"
+#include "Rendering/VR/VRLua.h"
+#include "Rml/Backends/RmlUi_Backend.h"
+#endif
+
 CLuaMenu* luaMenu = nullptr;
 
 /***
@@ -117,6 +123,10 @@ CLuaMenu::~CLuaMenu()
 {
 	RECOIL_DETAILED_TRACY_ZONE;
 	luaMenu = nullptr;
+#ifdef ENABLE_OPENXR
+	// the Lua state is gone (KillLua also let go of RmlUi's Lua side)
+	VRLua::ForgetMenuHandler();
+#endif
 }
 
 
@@ -131,6 +141,51 @@ string CLuaMenu::LoadFile(const string& name) const
 
 	return code;
 }
+
+
+#ifdef ENABLE_OPENXR
+// RmlUi was set up by LuaMenu (not left over from a game), so LuaMenu shuts it down
+static bool vrMenuStartedRmlUi = false;
+
+void CLuaMenu::VRAcquireRmlUi()
+{
+	if (!VRLua::MenuWantsRmlUi() || rmlui || luaUI != nullptr || game != nullptr || !IsValid())
+		return;
+	if (RmlGui::GetLuaState() != nullptr)
+		return; // someone else holds it
+
+	vrMenuStartedRmlUi = true;
+	InitializeRmlUi();
+	if (!rmlui) {
+		LOG_L(L_WARNING, "[VR] LuaMenu could not get RmlUi for the headset menu");
+		return;
+	}
+
+	LOG("[VR] LuaMenu holds RmlUi (headset menu)");
+	VRLua::SetMenuHoldsRmlUi(true);
+	VRLua::CallMenuRmlUiHandler(L, true);
+}
+
+void CLuaMenu::VRReleaseRmlUiIfHeld()
+{
+	if (luaMenu != nullptr && luaMenu->rmlui) {
+		VRLua::SetMenuHoldsRmlUi(false);
+		VRLua::CallMenuRmlUiHandler(luaMenu->L, false);
+
+		lua_pushnil(luaMenu->L);
+		lua_setglobal(luaMenu->L, "RmlUi");
+		luaMenu->rmlui = false;
+		LOG("[VR] LuaMenu gave up RmlUi");
+	}
+
+	// all of it (Lua side, contexts, Rml::Shutdown), as ~CGame does, so the
+	// next game's LuaUI starts from scratch
+	if (vrMenuStartedRmlUi) {
+		vrMenuStartedRmlUi = false;
+		RmlGui::Shutdown();
+	}
+}
+#endif
 
 
 bool CLuaMenu::RemoveSomeOpenGLFunctions(lua_State* L)
@@ -168,6 +223,10 @@ bool CLuaMenu::RemoveSomeOpenGLFunctions(lua_State* L)
 
 bool CLuaMenu::LoadUnsyncedCtrlFunctions(lua_State* L)
 {
+#ifdef ENABLE_OPENXR
+	// Zero-K VR: SetVRPanels, GetVRView, SetVRTVShown, SetVRMenuRmlUiHandler
+	VRLua::PushMenuEntries(L);
+#endif
 	REGISTER_SCOPED_LUA_CFUNC(LuaUnsyncedCtrl, Echo);
 	REGISTER_SCOPED_LUA_CFUNC(LuaUnsyncedCtrl, Log);
 
@@ -332,6 +391,9 @@ bool CLuaMenu::Disable()
 void CLuaMenu::ActivateMenu(const std::string& msg)
 {
 	RECOIL_DETAILED_TRACY_ZONE;
+#ifdef ENABLE_OPENXR
+	VRAcquireRmlUi();
+#endif
 	LUA_CALL_IN_CHECK(L);
 	luaL_checkstack(L, 3, __func__);
 
