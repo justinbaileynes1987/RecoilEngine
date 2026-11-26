@@ -21,6 +21,9 @@
 #include "Map/Ground.h"
 #include "Rendering/VR/VRState.h"
 #include "Sim/Features/Feature.h"
+#include "Sim/Features/FeatureDef.h"
+#include "Sim/Units/UnitDef.h"
+#include "System/Log/ILog.h"
 #include "Map/ReadMap.h"
 #include "Rendering/GlobalRendering.h"
 #include "Sim/Misc/GlobalConstants.h"
@@ -42,6 +45,73 @@ namespace {
 	int anchorX = 0;
 	int anchorY = 0;
 	bool shiftDown = false; // the pointer is holding Shift
+
+	// pointer log: picks that end in mid-air (headset reports of a pointer
+	// "blocked by something invisible"), at most every half second or so
+	int logCooldown = 0;
+	int logCount = 0;
+	constexpr int LOG_EVERY = 45;  // pointer updates (~90 per second)
+	constexpr int LOG_MAX = 3000;
+
+	const char* PickHowName(int how)
+	{
+		switch (how) {
+			case VRState::PICK_HULL:          return "unit hull";
+			case VRState::PICK_SHELL:         return "unit selection shell";
+			case VRState::PICK_ICON:          return "unit icon";
+			case VRState::PICK_FEATURE_HULL:  return "feature hull";
+			case VRState::PICK_FEATURE_SHELL: return "feature selection shell";
+			default:                          return "ground";
+		}
+	}
+
+	void LogFloatingPick(const VRPointer::Input& in, float dist, const CUnit* hitUnit, const CFeature* hitFeature)
+	{
+		if (logCooldown > 0)
+			--logCooldown;
+		if (logCooldown > 0 || logCount >= LOG_MAX)
+			return;
+
+		const float elmosPerCm = in.length / 500.0f; // the ray is 5 m of table
+		const VRState::PickDebug& dbg = VRState::pickDebug;
+		const float mapX = static_cast<float>(mapDims.mapx * SQUARE_SIZE);
+		const float mapZ = static_cast<float>(mapDims.mapy * SQUARE_SIZE);
+
+		if (dist < 0.0f) {
+			// a miss is normal only when the ray leaves the map upwards or sideways
+			if (in.dir.y >= 0.0f)
+				return;
+			LOG("[VR] pointer: miss, ground=%.0f water=%.0f length=%.0f from=(%.0f, %.0f, %.0f) dir=(%.2f, %.2f, %.2f) map=%.0fx%.0f",
+				dbg.groundDist, dbg.waterDist, in.length, in.from.x, in.from.y, in.from.z, in.dir.x, in.dir.y, in.dir.z, mapX, mapZ);
+		} else {
+			const float3 p = in.from + in.dir * dist;
+			const float above = p.y - std::max(CGround::GetHeightReal(p.x, p.z, false), 0.0f);
+
+			// on the ground, or on a unit no taller than ~2 cm of table: fine
+			if (above < 2.0f * elmosPerCm)
+				return;
+
+			const char* name = "-";
+			if (hitUnit != nullptr)
+				name = hitUnit->unitDef->name.c_str();
+			else if (hitFeature != nullptr)
+				name = hitFeature->def->name.c_str();
+
+			LOG("[VR] pointer: %s %s, %.0f elmos (%.1f cm) above the ground at (%.0f, %.0f, %.0f); dist=%.0f ground=%.0f water=%.0f from=(%.0f, %.0f, %.0f) dir=(%.2f, %.2f, %.2f) map=%.0fx%.0f",
+				PickHowName(dbg.how), name, above, above / elmosPerCm, p.x, p.y, p.z, dist, dbg.groundDist, dbg.waterDist,
+				in.from.x, in.from.y, in.from.z, in.dir.x, in.dir.y, in.dir.z, mapX, mapZ);
+
+			const VRState::PickDebugIcon& icon = VRState::pickDebugIcon;
+			if (dbg.how == VRState::PICK_ICON && hitUnit != nullptr && icon.unitID == hitUnit->id) {
+				LOG("[VR] pointer:   icon of unit %d (team %d) drawn at (%.0f, %.0f, %.0f), unit at (%.0f, %.0f, %.0f), half-size %.0f elmos (%.1f cm) from an eye distance of %.0f",
+					hitUnit->id, hitUnit->team, icon.center.x, icon.center.y, icon.center.z, hitUnit->pos.x, hitUnit->pos.y, hitUnit->pos.z,
+					icon.radius, icon.radius / elmosPerCm, icon.eyeDist);
+			}
+		}
+
+		logCooldown = LOG_EVERY;
+		++logCount;
+	}
 }
 
 
@@ -215,9 +285,12 @@ VRPointer::Result VRPointer::Update(const Input& in)
 		const CFeature* hitFeature = nullptr;
 
 		// pick along the controller ray, judging icons as the headset shows them
+		VRState::pickElmosPerMetre = in.length / 5.0f; // the ray is 5 m of table
 		VRState::pickFromEye = true;
 		const float dist = TraceRay::GuiTraceRay(in.from, in.dir, in.length, nullptr, hitUnit, hitFeature, true);
 		VRState::pickFromEye = false;
+
+		LogFloatingPick(in, dist, hitUnit, hitFeature);
 
 		if (dist >= 0.0f) {
 			result.worldHit = true;

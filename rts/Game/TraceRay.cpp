@@ -13,6 +13,7 @@
 #include "Sim/Misc/CollisionHandler.h"
 #include "Sim/Misc/CollisionVolume.h"
 #include "Sim/Misc/GeometricObjects.h"
+#include "Sim/Misc/GlobalConstants.h"
 #include "Sim/Misc/LosHandler.h"
 #include "Sim/Misc/QuadField.h"
 #include "Sim/Misc/TeamHandler.h"
@@ -381,7 +382,7 @@ static bool VRPickIcon(const CUnit* u, float& iconRadius)
 
 	const unsigned short losStatus = u->losStatus[gu->myAllyTeam];
 
-	const float dist = VRState::IconSwitchDistance(u->drawMidPos);
+	const float dist = VRState::IconSwitchDistance(u->GetObjDrawMidPos());
 	const auto& iconData = icon::iconHandler.GetIconData(u->currentIconIndex);
 
 	iconRadius = iconData.GetSize() * dist * VRState::iconHalfSizeTan;
@@ -473,8 +474,29 @@ float GuiTraceRay(
 	// of distance to ground and water surface
 	if (!ignoreWater)
 		minRayLength = std::min(groundRayLength, waterRayLength);
+
+	// Zero-K VR: the pointer ray is short (a few metres of table), so it often
+	// reaches the ground but not the water plane, or (past the map's edge) the
+	// water plane but not the ground. The plain min then picks the miss (-1)
+	// and the ray "hits" nothing short of its full length, in mid-air. Take
+	// whichever of the two it really reaches.
+	if (VRState::pickFromEye && !ignoreWater) {
+		if (groundRayLength < 0.0f)
+			minRayLength = waterRayLength;
+		else if (waterRayLength < 0.0f)
+			minRayLength = groundRayLength;
+	}
+
 	if (groundOnly)
 		return minRayLength;
+
+	if (VRState::pickFromEye) {
+		VRState::pickDebug = {};
+		VRState::pickDebugIcon = {};
+		VRState::pickDebug.groundDist = groundRayLength;
+		VRState::pickDebug.waterDist = ignoreWater ? -1.0f : waterRayLength;
+	}
+	int pickHow = VRState::PICK_NONE;
 
 	// set maximum ray until ground intersection taking lenience into account later
 	float maxRayLength;
@@ -490,14 +512,21 @@ float GuiTraceRay(
 	}
 	maxRayLength = std::min(maxRayLength + globalConfig.selectThroughGround, length);
 
+	// Zero-K VR: the eye views draw unit icons over the terrain, so the pointer
+	// can pick an icon it sees behind a hill: look along the whole ray, and
+	// let only models and features be hidden by the ground (below)
+	const bool iconsThroughGround = VRState::pickFromEye;
+	const float queryRayLength = iconsThroughGround ? length : maxRayLength;
+	bool hitIsIcon = false;
+
 	CollisionQuery cq;
 
 	QuadFieldQuery qfQuery;
 	if (useRadar) {
 		const float allyTeamError = losHandler->GetAllyTeamRadarErrorSize(gu->myAllyTeam);
-		quadField.GetQuadsOnWideRay(qfQuery, start, dir, maxRayLength, allyTeamError);
+		quadField.GetQuadsOnWideRay(qfQuery, start, dir, queryRayLength, allyTeamError);
 	} else {
-		quadField.GetQuadsOnRay(qfQuery, start, dir, maxRayLength);
+		quadField.GetQuadsOnRay(qfQuery, start, dir, queryRayLength);
 	}
 
 	for (const int quadIdx: *qfQuery.quads) {
@@ -521,6 +550,9 @@ float GuiTraceRay(
 				continue;
 			if (!unitVisible)
 				continue;
+			// Zero-K VR: the pointer never hits what the headset does not show
+			if (VRState::pickFromEye && u->noDraw)
+				continue;
 
 			CollisionVolume cv = u->selectionVolume;
 
@@ -534,11 +566,83 @@ float GuiTraceRay(
 			if (isIcon || (!unitInSight && unitOnRadar && unitIsEnemy))
 				cv.InitSphere(iconRadius);
 
-			if (CCollisionHandler::MouseHit(u, u->GetTransformMatrix(false), start, start + dir * guiRayLength, &cv, &cq)) {
+			const bool shownAsIcon = (isIcon || (!unitInSight && unitOnRadar && unitIsEnemy));
+			float ingressDist = 0.0f;
+			float  egressDist = 0.0f;
+			int unitHow = shownAsIcon ? VRState::PICK_ICON : VRState::PICK_HULL;
+
+			if (iconsThroughGround && shownAsIcon) {
+				// Zero-K VR: an icon is a flat picture facing the eye, drawn
+				// where CUnitDrawerGLSL::DrawUnitIcon puts it (lifted clear of
+				// the ground by its own size). The pointer hits it when it
+				// passes within the icon's half-size of that point, and the hit
+				// is there, on the icon, not on the skin of a sphere around the
+				// unit (seen in the headset 2026-11-25: a solar collector's icon
+				// stopped the pointer up to 14 cm above the table). The size is
+				// capped at a few cm of table, whatever the eye distance says.
+				float3 center = gu->spectatingFullView ? u->GetObjDrawMidPos() : u->GetObjDrawErrorPos(gu->myAllyTeam);
+				const float maxRadius = VRState::ICON_PICK_MAX_RADIUS_M * VRState::pickElmosPerMetre * std::max(icon::iconHandler.GetIconData(u->currentIconIndex).GetSize(), 1.0f);
+				const float radius = std::min(iconRadius, maxRadius);
+				const float h = CGround::GetHeightReal(center.x, center.z, false);
+				center.y = std::max(center.y, h + radius);
+
+				const float t = (center - start).dot(dir);
+				if (t <= 0.0f || t > guiRayLength)
+					continue;
+				if ((start + dir * t).SqDistance(center) > radius * radius)
+					continue;
+
+				ingressDist = t;
+				egressDist = t;
+
+				if (VRState::pickDebugIcon.unitID < 0 || t < VRState::pickDebugIcon.dist) {
+					VRState::pickDebugIcon.unitID = u->id;
+					VRState::pickDebugIcon.dist = t;
+					VRState::pickDebugIcon.center = center;
+					VRState::pickDebugIcon.radius = iconRadius;
+					VRState::pickDebugIcon.eyeDist = VRState::IconSwitchDistance(u->GetObjDrawMidPos());
+				}
+			} else if (iconsThroughGround && !shownAsIcon) {
+				// Zero-K VR: games enlarge selection volumes (Zero-K: 1.35 to 1.5
+				// times, or a footprint-sized ellipsoid) to make clicking easy.
+				// A pointer ray passing over a unit clipped that invisible shell
+				// and stopped in mid-air, out of reach of the ground behind. So
+				// the unit's own hull counts as a hit; the enlarged shell only
+				// when the ray meets the ground (or water) right at the unit,
+				// and then the hit is that ground point, not the shell.
+				const CMatrix44f mat = u->GetTransformMatrix(false);
+				const float3 end = start + dir * guiRayLength;
+
+				if (CCollisionHandler::MouseHit(u, mat, start, end, &u->collisionVolume, &cq)) {
+					ingressDist = cq.GetIngressPosDist(start, dir);
+					egressDist = cq.GetEgressPosDist(start, dir);
+				} else if (CCollisionHandler::MouseHit(u, mat, start, end, &cv, &cq)) {
+					const float in = cq.GetIngressPosDist(start, dir);
+					const float out = cq.GetEgressPosDist(start, dir);
+					const float margin = std::max(u->radius * 0.25f, static_cast<float>(SQUARE_SIZE));
+
+					if (minRayLength < 0.0f || minRayLength > out + margin)
+						continue; // passes over or beside it, on to the ground beyond
+
+					ingressDist = std::clamp(minRayLength, in, out);
+					egressDist = out;
+					unitHow = VRState::PICK_SHELL;
+				} else {
+					continue;
+				}
+			} else if (CCollisionHandler::MouseHit(u, u->GetTransformMatrix(false), start, start + dir * guiRayLength, &cv, &cq)) {
 				// get the distance to the ray-volume ingress point
 				// (not likely to generate inside-hit special cases)
-				const float ingressDist = cq.GetIngressPosDist(start, dir);
-				const float  egressDist = cq.GetEgressPosDist(start, dir);
+				ingressDist = cq.GetIngressPosDist(start, dir);
+				egressDist = cq.GetEgressPosDist(start, dir);
+			} else {
+				continue;
+			}
+
+			{
+				// Zero-K VR: a model behind the ground stays hidden; an icon does not
+				if (iconsThroughGround && !shownAsIcon && ingressDist > maxRayLength)
+					continue;
 
 				const bool factoryUnderCursor = u->unitDef->IsFactoryUnit();
 				const bool factoryHitBeforeUnit = ((hitFactory && ingressDist < minIngressDist) || (!hitFactory &&  egressDist < minIngressDist));
@@ -552,6 +656,8 @@ float GuiTraceRay(
 
 					hitUnit = u;
 					hitFeature = nullptr;
+					hitIsIcon = shownAsIcon;
+					pickHow = unitHow;
 				}
 			}
 		}
@@ -571,7 +677,26 @@ float GuiTraceRay(
 			const CollisionVolume& cv = f->selectionVolume;
 
 			if (CCollisionHandler::MouseHit(f, f->GetTransformMatrix(false), start, start + dir * guiRayLength, &cv, &cq)) {
-				const float hitDist = cq.GetHitPosDist(start, dir);
+				float hitDist = cq.GetHitPosDist(start, dir);
+				int featureHow = VRState::PICK_FEATURE_HULL;
+
+				// Zero-K VR: as for units, the enlarged shell only counts where the
+				// ray meets the ground at the feature, and then at that ground point
+				if (iconsThroughGround) {
+					CollisionQuery hullQuery;
+					if (CCollisionHandler::MouseHit(f, f->GetTransformMatrix(false), start, start + dir * guiRayLength, &f->collisionVolume, &hullQuery)) {
+						hitDist = hullQuery.GetHitPosDist(start, dir);
+					} else {
+						const float out = cq.GetEgressPosDist(start, dir);
+						const float margin = std::max(f->radius * 0.25f, static_cast<float>(SQUARE_SIZE));
+						if (minRayLength < 0.0f || minRayLength > out + margin)
+							continue;
+						hitDist = std::clamp(minRayLength, hitDist, std::max(out, hitDist));
+						featureHow = VRState::PICK_FEATURE_SHELL;
+					}
+					if (hitDist > maxRayLength)
+						continue;
+				}
 
 				const bool factoryHitBeforeUnit = ( hitFactory && hitDist <  minEgressDist);
 				const bool unitHitInsideFactory = (!hitFactory && hitDist < minIngressDist);
@@ -584,17 +709,29 @@ float GuiTraceRay(
 
 					hitFeature = f;
 					hitUnit = nullptr;
+					hitIsIcon = false;
+					pickHow = featureHow;
 				}
 			}
 		}
 	}
 
-	if ((minRayLength > 0.0f) && (maxRayLength < minIngressDist)) {
+	// Zero-K VR: a picked icon wins over the ground in front of it
+	if ((minRayLength > 0.0f) && (maxRayLength < minIngressDist) && !(iconsThroughGround && hitIsIcon && hitUnit != nullptr)) {
 		minIngressDist = minRayLength;
 
 		hitUnit    = nullptr;
 		hitFeature = nullptr;
+		pickHow = VRState::PICK_NONE;
 	}
+
+	if (VRState::pickFromEye)
+		VRState::pickDebug.how = pickHow;
+
+	// Zero-K VR: the pointer reached neither ground nor water and hit nothing:
+	// report a miss, not a hit at the end of the ray (in mid-air)
+	if (iconsThroughGround && hitUnit == nullptr && hitFeature == nullptr && minRayLength < 0.0f)
+		return -1.0f;
 
 	return minIngressDist;
 }

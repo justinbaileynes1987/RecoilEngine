@@ -53,8 +53,47 @@ namespace VRState {
 	// eye views show them (IconSwitchDistance)
 	inline bool pickFromEye = false;
 
+	// what the pointer's last pick was decided by, for the pointer log
+	// (VRPointer.cpp): ground and water distances along the ray (-1: missed)
+	// and how the hit object was hit
+	enum PickHow { PICK_NONE = 0, PICK_HULL, PICK_SHELL, PICK_ICON, PICK_FEATURE_HULL, PICK_FEATURE_SHELL };
+	struct PickDebug {
+		float groundDist = -1.0f;
+		float waterDist = -1.0f;
+		int how = PICK_NONE;
+	};
+	inline PickDebug pickDebug;
+
+	// the nearest icon the last pick hit (unitID -1: none), for the pointer log
+	struct PickDebugIcon {
+		int unitID = -1;
+		float dist = 0.0f;
+		float3 center;        // where the icon is drawn
+		float radius = 0.0f;  // its half-size from the eye distance, before the cap
+		float eyeDist = 0.0f;
+	};
+	inline PickDebugIcon pickDebugIcon;
+
+	// world scale of the pointer's pick (elmos per metre of table), set by
+	// VRPointer; icon picks are capped at this many metres per unit of the
+	// icon's own size
+	inline float pickElmosPerMetre = 1.0f;
+	constexpr float ICON_PICK_MAX_RADIUS_M = 0.015f;
+
 	// both eyes in world space, set by CVRManager::DrawEyes each frame
 	inline float3 eyePos[2];
+
+	// world scale of the eye views (elmos per metre of table), set by
+	// CVRManager::DrawEyes; LuaUI sizes VR-only drawings with it (Spring.GetVRView)
+	inline float eyeElmosPerMetre = 1.0f;
+
+	// the hand that drives the pointer (0 left, 1 right), mirrored by
+	// CVRManager for Spring.GetVRView
+	inline int pointerHand = 1;
+
+	// the big desktop panel (TV) is shown while UI panels exist: the pointer
+	// hand's thumbstick click or Spring.SetVRTVShown toggles it
+	inline bool tvShown = true;
 
 	// unit icons in the eye views, as tangents of angles seen from the eye:
 	// a unit whose radius looks smaller than iconSwitchTan is drawn as an icon,
@@ -74,10 +113,10 @@ namespace VRState {
 	// window pixels) that LuaUI asks to show as panels of their own in the
 	// headset (Spring.SetVRPanels, see VRLua.cpp). The pointer clicks them
 	// like the desktop panel. Every change bumps uiPanelsVersion.
-	enum UIPanelAnchor { UI_ANCHOR_BAR = 0, UI_ANCHOR_PALETTE = 1, UI_ANCHOR_SIDE = 2 };
+	enum UIPanelAnchor { UI_ANCHOR_BAR = 0, UI_ANCHOR_PALETTE = 1, UI_ANCHOR_SIDE = 2, UI_ANCHOR_CENTER = 3 };
 	struct UIPanelRequest {
 		std::string name;
-		int anchor = UI_ANCHOR_BAR; // bar: on the table's far edge; palette: on the off hand
+		int anchor = UI_ANCHOR_BAR; // bar: on the table's far edge; palette: over the off hand; side: by the pointer hand; center: in front of you
 		float widthM = 0.0f;        // physical width in metres; 0 = the anchor's default metres per pixel
 		bool canvas = false;        // source "vr": a rectangle of the VR UI canvas (RmlUi "vr_" contexts, see VRRml.h), not the desktop frame
 		bool hidden = false;        // kept (with its swapchain) but not shown, so showing it later is instant

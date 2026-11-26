@@ -69,11 +69,11 @@ CONFIG(bool, VRUIPanels).defaultValue(true).description("Zero-K VR (table view):
 CONFIG(float, VRBarScale).defaultValue(0.0007f).minimumValue(0.0001f).description("Zero-K VR: size of the table-edge UI bar, in metres per window pixel (when LuaUI gives no width).");
 CONFIG(float, VRBarMaxDistance).defaultValue(1.6f).minimumValue(0.3f).description("Zero-K VR: the table-edge UI bar always stands on the table's far edge; when that is farther than this many metres (horizontally) from your head, it grows so it reads the same size.");
 CONFIG(float, VRPaletteScale).defaultValue(0.0005f).minimumValue(0.0001f).description("Zero-K VR: size of the off-hand UI palette, in metres per window pixel.");
-CONFIG(float, VRSideAngle).defaultValue(40.0f).description("Zero-K VR: how far round to the pointer hand's side the side UI panel (orders, build menu) sits, in degrees from where you face.");
+CONFIG(float, VRSideAngle).defaultValue(40.0f).description("Zero-K VR: how far round to the pointer hand's side (it swaps with the pointer) the side UI panel (orders, build menu) sits, in degrees from where you face.");
 CONFIG(float, VRSideDistance).defaultValue(0.6f).minimumValue(0.2f).description("Zero-K VR: distance in metres from your head to the side UI panel.");
 CONFIG(float, VRSideHeight).defaultValue(-0.35f).description("Zero-K VR: height in metres of the side UI panel's centre relative to your eyes.");
 CONFIG(float, VRSideMaxAngle).defaultValue(100.0f).description("Zero-K VR: the side UI panel swings further round to your side, up to this many degrees from where you face, when it would hide the table from your eyes.");
-CONFIG(float, VRPaletteTilt).defaultValue(30.0f).description("Zero-K VR: how far the off-hand palette leans back from the controller's grip, in degrees, so its face points up towards your eyes.");
+CONFIG(float, VRPaletteRaise).defaultValue(0.5f).description("Zero-K VR: the off-hand palette (quick orders) floats over the off hand, facing your eyes, while that hand is raised higher than this many metres below your eyes and is in front of you.");
 
 
 namespace {
@@ -226,6 +226,12 @@ struct CVRManager::Impl
 
 	ColorSwapchain mirror;
 	ColorSwapchain eyes[NUM_EYES];
+	// the pointer rays for each eye on a transparent image, submitted after the
+	// UI panels so the rays show over them (layers have no depth: a panel
+	// layer covers whatever the eye layer drew where it stands)
+	ColorSwapchain overlay[NUM_EYES];
+	bool overlayOK = false;
+	bool overlayDrawn = false;
 	GLuint blitFBO = 0;
 
 	// single-sampled copy of the back buffer: the default framebuffer may be
@@ -303,6 +309,7 @@ struct CVRManager::Impl
 		ColorSwapchain sc;
 		bool hidden = false;            // LuaUI keeps it but does not show it (its swapchain stays)
 		bool visible = false;           // this frame
+		bool drawn = false;             // submitted to the compositor last frame; only then can the pointer hit it
 		PanelQuad quad;
 	};
 	std::vector<UIPanelLayer> uiLayers;
@@ -313,8 +320,8 @@ struct CVRManager::Impl
 	int swapchainRetryIn = 0;     // frames until the next try after a failure
 	int uiPanelsVersionSeen = -1;
 	bool uiPanelsEnabled = true;  // VRUIPanels
-	bool tvShown = true;          // the big desktop panel, while UI panels exist (thumbstick toggle; shown by default)
-	bool paletteShown = false;    // the off-hand palette faces the head (with hysteresis)
+	std::string lastPanelLogged;  // pointer log: the panel last reported under the pointer
+	bool paletteShown = false;    // the off-hand palette is up (hand raised, with hysteresis)
 	// VR UI (RmlUi) pointer state: buttons held on the UI, hovering it, or a
 	// button held in the world (a drag), so a press keeps its target until release
 	// the bar's heading (turns to the player as they walk around the table)
@@ -332,6 +339,10 @@ struct CVRManager::Impl
 	float sideAngleNow = 0.0f;  // the angle in use, eased towards the clearest one
 	float sideLiftNow = 0.0f;   // metres raised above VRSideHeight to clear the table, eased
 	bool sideAngleValid = false;
+	// centre panels (the menu): placed when they appear, fixed until hidden
+	bool centerValid = false;
+	float centerYaw = 0.0f;
+	float3 centerPos;
 	bool uiButtons[2] = {false, false};
 	bool uiHover = false;
 	bool worldHeld = false;
@@ -344,7 +355,7 @@ struct CVRManager::Impl
 	float barScale = 0.0007f;
 	float barMaxDistance = 1.6f;
 	float paletteScale = 0.0005f;
-	float paletteTilt = 0.52f;    // radians
+	float paletteRaise = 0.5f;    // metres below the eyes the off hand must be raised above (VRPaletteRaise)
 	void SyncUIPanels();
 	void LayoutUIPanels();
 	void EnsureUISwapchains();
@@ -355,7 +366,7 @@ struct CVRManager::Impl
 	// whether the big desktop panel shows: always outside the eye views (menus),
 	// in-game when VRPanel is on and either no UI panels exist or it is toggled on
 	bool TVVisible(bool inGameView) const {
-		return !inGameView || (showPanel && (!HaveUIPanels() || tvShown));
+		return !inGameView || (showPanel && (!HaveUIPanels() || VRState::tvShown));
 	}
 	bool HaveUIPanels() const { return uiPanelsEnabled && tableView && !uiLayers.empty(); }
 
@@ -377,6 +388,8 @@ struct CVRManager::Impl
 	bool CopyBackBufferTo(ColorSwapchain& sc, int srcX, int srcY, int srcSizeX, int srcSizeY) {
 		return ResolveBackBuffer(srcX, srcY, srcSizeX, srcSizeY) && BlitResolvedTo(sc, 0, 0, srcSizeX, srcSizeY);
 	}
+	// clear eye i's overlay image to transparent and run draw into it
+	bool DrawOverlay(uint32_t eye, const std::function<void()>& draw);
 	void SubmitFrame(bool haveFrame);
 };
 
@@ -609,6 +622,11 @@ bool CVRManager::Impl::CreateSwapchains()
 
 		LOG("[VR] eye swapchains %dx%d (world is drawn at the desktop view size %dx%d, then scaled)",
 			eyes[0].sizeX, eyes[0].sizeY, globalRendering->viewSizeX, globalRendering->viewSizeY);
+
+		// optional: without it the rays stay under the panels
+		overlayOK = CreateColorSwapchain(eyes[0].sizeX, eyes[0].sizeY, overlay[0]) && CreateColorSwapchain(eyes[1].sizeX, eyes[1].sizeY, overlay[1]);
+		if (!overlayOK)
+			LOG_L(L_WARNING, "[VR] no pointer overlay swapchains; the pointer rays are drawn under the UI panels");
 	}
 
 	glGenFramebuffers(1, &blitFBO);
@@ -643,7 +661,7 @@ void CVRManager::Impl::Destroy()
 	canvasSizeX = 0;
 	canvasSizeY = 0;
 
-	for (ColorSwapchain* sc: {&mirror, &eyes[0], &eyes[1]}) {
+	for (ColorSwapchain* sc: {&mirror, &eyes[0], &eyes[1], &overlay[0], &overlay[1]}) {
 		if (sc->handle != XR_NULL_HANDLE)
 			xrDestroySwapchain(sc->handle);
 
@@ -935,6 +953,47 @@ bool CVRManager::Impl::BlitResolvedTo(ColorSwapchain& sc, int srcX, int srcY, in
 }
 
 
+bool CVRManager::Impl::DrawOverlay(uint32_t eye, const std::function<void()>& draw)
+{
+	ColorSwapchain& sc = overlay[eye];
+	if (!overlayOK || sc.handle == XR_NULL_HANDLE)
+		return false;
+
+	uint32_t imageIndex = 0;
+	XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+	if (!Check(xrAcquireSwapchainImage(sc.handle, &acquireInfo, &imageIndex), "xrAcquireSwapchainImage (overlay)"))
+		return false;
+
+	XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+	waitInfo.timeout = XR_INFINITE_DURATION;
+	if (!Check(xrWaitSwapchainImage(sc.handle, &waitInfo), "xrWaitSwapchainImage (overlay)"))
+		return false;
+
+	{
+		BlitStateGuard guard;
+		GLint prevViewport[4];
+		GLfloat prevClear[4];
+		glGetIntegerv(GL_VIEWPORT, prevViewport);
+		glGetFloatv(GL_COLOR_CLEAR_VALUE, prevClear);
+
+		glBindFramebuffer(GL_FRAMEBUFFER, blitFBO);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sc.images[imageIndex].image, 0);
+		glViewport(0, 0, sc.sizeX, sc.sizeY);
+		glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+
+		draw();
+
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+		glClearColor(prevClear[0], prevClear[1], prevClear[2], prevClear[3]);
+		glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+	}
+
+	XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+	return Check(xrReleaseSwapchainImage(sc.handle, &releaseInfo), "xrReleaseSwapchainImage (overlay)");
+}
+
+
 // grab the table with the grip button: one hand moves it, two hands also
 // turn it (around the vertical) and zoom it (by the change in hand distance)
 void CVRManager::Impl::UpdateTable()
@@ -1081,7 +1140,7 @@ void CVRManager::Impl::SyncUIPanels()
 		layer.h = y1 - y0;
 		layer.metresPerPixel = (req.widthM > 0.0f) ? req.widthM / static_cast<float>(layer.w) : 0.0f;
 
-		summary += " " + layer.name + (layer.hidden ? "[hidden]" : "") + ((layer.anchor == VRState::UI_ANCHOR_PALETTE) ? "(palette " : (layer.anchor == VRState::UI_ANCHOR_SIDE) ? "(side " : "(bar ") + std::to_string(layer.w) + "x" + std::to_string(layer.h) + ")";
+		summary += " " + layer.name + (layer.hidden ? "[hidden]" : "") + ((layer.anchor == VRState::UI_ANCHOR_PALETTE) ? "(palette " : (layer.anchor == VRState::UI_ANCHOR_SIDE) ? "(side " : (layer.anchor == VRState::UI_ANCHOR_CENTER) ? "(center " : "(bar ") + std::to_string(layer.w) + "x" + std::to_string(layer.h) + ")";
 		next.push_back(std::move(layer));
 	}
 
@@ -1187,8 +1246,9 @@ void CVRManager::Impl::EnsureUISwapchains()
 // places the UI panels for this frame (LOCAL space):
 //  - bar: standing on the table's far edge, facing the player, leaning back a
 //    little, left to right in list order; never farther than VRBarMaxDistance
-//  - palette: over the off hand's controller, bottom to top in list order,
-//    shown while it faces the head (glance at it like a tablet)
+//  - side: off to the pointer hand's side, following the head lazily
+//  - palette: over the off hand's controller, facing the eyes, bottom to top
+//    in list order, shown while that hand is raised in front of you
 void CVRManager::Impl::LayoutUIPanels()
 {
 	HideUIPanels();
@@ -1310,7 +1370,9 @@ void CVRManager::Impl::LayoutUIPanels()
 			}
 			sidePos = sidePos + (head - sidePos) * 0.1f;
 
-			// pointer hand right (1): the panel goes to the right (clockwise, negative yaw)
+			// on the pointer hand's side, within easy reach of the pointer: pointer
+			// hand right (1), the panel goes to the right (clockwise, negative yaw).
+			// It swaps sides with the pointer (left-handed players).
 			const float sideSign = (pointerHand == 1) ? -1.0f : 1.0f;
 
 			float totalW = 0.0f;
@@ -1411,6 +1473,56 @@ void CVRManager::Impl::LayoutUIPanels()
 		}
 	}
 
+	// centre panels (a menu): in front of you at about eye height, placed
+	// where you look when they appear and left there until they are hidden,
+	// so looking around or pointing at them never moves them
+	{
+		float totalH = 0.0f;
+		for (const UIPanelLayer& layer: uiLayers) {
+			if (layer.anchor == VRState::UI_ANCHOR_CENTER && !layer.hidden)
+				totalH += layer.h * Scale(layer, sideScale);
+		}
+
+		if (totalH <= 0.0f || !viewsValid) {
+			centerValid = false;
+		} else {
+			constexpr float DISTANCE = 0.75f;
+			constexpr float DROP = 0.08f; // centre below the eyes
+			constexpr float LEAN = 10.0f * 0.0174533f;
+			constexpr float GAP = 0.015f;
+
+			if (!centerValid) {
+				float3 fwd = ToF3(Rotate(views[0].pose.orientation, {0.0f, 0.0f, -1.0f}));
+				fwd.y = 0.0f;
+				centerYaw = (fwd.SqLength() > 1e-4f) ? YawOf(fwd) : 0.0f;
+				centerPos = head + RotY(float3(0.0f, 0.0f, -1.0f), centerYaw) * DISTANCE;
+				centerPos.y = head.y - DROP;
+				centerValid = true;
+			}
+
+			const XrQuaternionf q = QuatMul(QuatAxisAngle(UpVector, centerYaw), QuatAxisAngle(float3(1.0f, 0.0f, 0.0f), -LEAN));
+			const float3 up = ToF3(Rotate(q, {0.0f, 1.0f, 0.0f}));
+
+			// stacked top to bottom in list order, centred on the anchor
+			float y = totalH * 0.5f;
+			for (UIPanelLayer& layer: uiLayers) {
+				if (layer.anchor != VRState::UI_ANCHOR_CENTER || layer.hidden)
+					continue;
+
+				const float w = layer.w * Scale(layer, sideScale);
+				const float h = layer.h * Scale(layer, sideScale);
+				const float3 c = centerPos + up * (y - h * 0.5f);
+
+				layer.quad.pose.orientation = q;
+				layer.quad.pose.position = ToXr(c);
+				layer.quad.width = w;
+				layer.quad.height = h;
+				layer.visible = true;
+				y -= h + GAP;
+			}
+		}
+	}
+
 	// the palette, on the hand that is not pointing, unless it holds the table
 	{
 		const int paletteHand = 1 - pointerHand;
@@ -1423,29 +1535,40 @@ void CVRManager::Impl::LayoutUIPanels()
 				totalH += layer.h * Scale(layer, paletteScale);
 		}
 
-		if (!handFree || totalH <= 0.0f) {
+		if (!handFree || totalH <= 0.0f || !viewsValid) {
 			paletteShown = false;
 			return;
 		}
 
 		constexpr float GAP = 0.01f;
-		constexpr float LIFT = 0.05f; // metres from the grip to the palette's bottom edge
+		constexpr float LIFT = 0.04f; // metres from the grip up to the palette's bottom edge
 
-		// the grip's +z points back along the controller (towards the player
-		// when pointing ahead) and +y up out of the hand: lean the face back
-		// so it points up towards the eyes
-		const XrQuaternionf q = QuatMul(hand.grip.orientation, QuatAxisAngle(float3(1.0f, 0.0f, 0.0f), -paletteTilt));
-		const float3 up = ToF3(Rotate(q, {0.0f, 1.0f, 0.0f}));
-		const float3 normal = ToF3(Rotate(q, {0.0f, 0.0f, 1.0f}));
+		// docked over the off hand like a PDA held up: it moves with the hand
+		// but always faces the eyes, so no wrist tilt is needed to read it.
+		// Shown while the hand is raised (above VRPaletteRaise below the eyes)
+		// and in front of you, so a hand resting at your side or low over the
+		// table never puts it in the way. Hysteresis so it doesn't flicker.
 		const float3 grip = ToF3(hand.grip.position);
-
-		// shown while it faces the head; hysteresis so it doesn't flicker
-		const float3 toHead = (head - (grip + up * (LIFT + totalH * 0.5f))).SafeNormalize();
-		const float facing = toHead.dot(normal);
-		paletteShown = (facing > (paletteShown ? 0.15f : 0.35f));
+		const float3 centre = grip + UpVector * (LIFT + totalH * 0.5f);
+		const float3 fwd = ToF3(Rotate(views[0].pose.orientation, {0.0f, 0.0f, -1.0f})).SafeNormalize();
+		const float3 toHand = (centre - head).SafeNormalize();
+		const float hys = paletteShown ? 0.05f : 0.0f;
+		const bool raised = (grip.y > head.y - paletteRaise - hys);
+		const bool inFront = (toHand.dot(fwd) > (paletteShown ? 0.35f : 0.5f));
+		paletteShown = raised && inFront;
 		if (!paletteShown)
 			return;
 
+		// face the eyes: +z towards the head, leaning back as far as the head is above
+		float3 toHeadFlat = head - centre;
+		toHeadFlat.y = 0.0f;
+		const float yaw = (toHeadFlat.SqLength() > 1e-6f) ? YawOf(-toHeadFlat) : 0.0f;
+		const float3 n = (head - centre).SafeNormalize();
+		const float lean = std::asin(std::clamp(n.y, -0.95f, 0.95f));
+		const XrQuaternionf q = QuatMul(QuatAxisAngle(UpVector, yaw), QuatAxisAngle(float3(1.0f, 0.0f, 0.0f), -lean));
+		const float3 up = ToF3(Rotate(q, {0.0f, 1.0f, 0.0f}));
+
+		// bottom to top in list order, from LIFT above the grip
 		float y = LIFT;
 		for (UIPanelLayer& layer: uiLayers) {
 			if (layer.anchor != VRState::UI_ANCHOR_PALETTE || layer.hidden)
@@ -1488,14 +1611,15 @@ void CVRManager::Impl::UpdatePointer()
 	// a thumbstick click on the pointer hand shows or hides the big desktop
 	// panel (menus, chat, settings; shown by default) while the UI panels are up
 	if (pressed[pointerHand][2] && HaveUIPanels()) {
-		tvShown = !tvShown;
-		LOG("[VR] desktop panel %s", tvShown ? "shown" : "hidden");
+		VRState::tvShown = !VRState::tvShown;
+		LOG("[VR] desktop panel %s", VRState::tvShown ? "shown" : "hidden");
 	}
 
 	const int otherHand = 1 - pointerHand;
 	const bool pointerBusy = (triggerRole[pointerHand] == TRIGGER_CLICK) || commandClick[pointerHand];
 	if ((pressed[otherHand][1] || pressed[otherHand][2]) && !pointerBusy)
 		pointerHand = otherHand;
+	VRState::pointerHand = pointerHand;
 
 	// what a trigger does is decided when it is pressed and kept until release,
 	// so a hand switch never turns a held Shift into a click or the reverse
@@ -1552,10 +1676,11 @@ void CVRManager::Impl::UpdatePointer()
 			const float3 from = ToF3(hand.aim.position);
 			const float3 dir = ToF3(dirXR);
 
+			const UIPanelLayer* hitPanel = nullptr;
 			const auto TryPanel = [&](const PanelQuad& quad, int px, int py, int pw, int ph, bool canvas) {
 				float t = 0.0f, u = 0.0f, v = 0.0f;
 				if (!RayQuad(quad, from, dir, t, u, v) || (panelT > 0.0f && t >= panelT))
-					return;
+					return false;
 
 				in.onPanel = !canvas;
 				onCanvas = canvas;
@@ -1563,6 +1688,7 @@ void CVRManager::Impl::UpdatePointer()
 				in.panelY = std::clamp(py + static_cast<int>((1.0f - v) * ph), 0, winY - 1);
 				panelT = t;
 				panelHitXR = ToXr(from + dir * t);
+				return true;
 			};
 
 			if (TVVisible(true)) {
@@ -1574,8 +1700,16 @@ void CVRManager::Impl::UpdatePointer()
 			}
 
 			for (const UIPanelLayer& layer: uiLayers) {
-				if (layer.visible)
-					TryPanel(layer.quad, layer.x, layer.y, layer.w, layer.h, layer.canvas);
+				if (layer.visible && layer.drawn && TryPanel(layer.quad, layer.x, layer.y, layer.w, layer.h, layer.canvas))
+					hitPanel = &layer;
+			}
+
+			// pointer log (see VRPointer.cpp): which panel takes the pointer, on change
+			const std::string hitName = (hitPanel != nullptr) ? hitPanel->name : (panelT > 0.0f ? std::string("tv") : std::string());
+			if (hitName != lastPanelLogged) {
+				if (!hitName.empty())
+					LOG("[VR] pointer: on panel %s", hitName.c_str());
+				lastPanelLogged = hitName;
 			}
 		}
 	}
@@ -1644,7 +1778,9 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 	XrCompositionLayerQuad panel = {XR_TYPE_COMPOSITION_LAYER_QUAD};
 	XrCompositionLayerQuad uiQuads[MAX_UI_LAYERS];
 
-	const XrCompositionLayerBaseHeader* layers[2 + MAX_UI_LAYERS];
+	const XrCompositionLayerBaseHeader* layers[3 + MAX_UI_LAYERS];
+	XrCompositionLayerProjectionView overlayViews[NUM_EYES];
+	XrCompositionLayerProjection overlayLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
 	uint32_t layerCount = 0;
 
 	if (frameState.shouldRender && eyesDrawn) {
@@ -1691,6 +1827,13 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 	// the UI panels, each from its own swapchain sized like its window
 	// rectangle (recreated when that size changes), so the whole image is
 	// used and no sub-image origin convention is involved
+	// a panel the pointer can hit must be one the headset shows (a panel left
+	// out below, say for want of a swapchain, would stop the pointer in mid-air)
+	if (frameState.shouldRender && haveFrame) {
+		for (UIPanelLayer& layer: uiLayers)
+			layer.drawn = false;
+	}
+
 	int uiCount = 0;
 	for (UIPanelLayer& layer: uiLayers) {
 		if (!layer.visible || uiCount >= MAX_UI_LAYERS || !(layer.canvas ? canvasReady : resolved))
@@ -1720,6 +1863,21 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 		quad.size = {layer.quad.width, layer.quad.height};
 
 		layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
+		layer.drawn = true;
+	}
+
+	// the pointer rays, over every panel
+	if (frameState.shouldRender && eyesDrawn && overlayDrawn) {
+		for (uint32_t i = 0; i < NUM_EYES; ++i) {
+			overlayViews[i] = projViews[i];
+			overlayViews[i].subImage.swapchain = overlay[i].handle;
+			overlayViews[i].subImage.imageRect.extent = {overlay[i].sizeX, overlay[i].sizeY};
+		}
+		overlayLayer.space = localSpace;
+		overlayLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+		overlayLayer.viewCount = NUM_EYES;
+		overlayLayer.views = overlayViews;
+		layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&overlayLayer);
 	}
 
 	XrFrameEndInfo frameEndInfo = {XR_TYPE_FRAME_END_INFO};
@@ -1779,7 +1937,7 @@ void CVRManager::Init()
 	impl->barScale = configHandler->GetFloat("VRBarScale");
 	impl->barMaxDistance = configHandler->GetFloat("VRBarMaxDistance");
 	impl->paletteScale = configHandler->GetFloat("VRPaletteScale");
-	impl->paletteTilt = configHandler->GetFloat("VRPaletteTilt") * 0.0174533f;
+	impl->paletteRaise = configHandler->GetFloat("VRPaletteRaise");
 	impl->sideAngle = configHandler->GetFloat("VRSideAngle") * 0.0174533f;
 	impl->sideDistance = configHandler->GetFloat("VRSideDistance");
 	impl->sideHeight = configHandler->GetFloat("VRSideHeight");
@@ -1814,6 +1972,7 @@ void CVRManager::BeginFrame()
 		return;
 
 	impl->eyesDrawn = false;
+	impl->overlayDrawn = false;
 	impl->viewsValid = false;
 	impl->frameState = {XR_TYPE_FRAME_STATE};
 
@@ -1942,7 +2101,8 @@ struct HandVisual {
 	SColor rayCol = SColor(220, 225, 235, 255);
 };
 
-static void DrawHands(const CCamera* cam, const HandVisual* hands, int numHands, const std::vector<float3>& selectionOutline, float lift)
+// raysOnly: just the pointer rays and their end markers (the overlay over the UI panels)
+static void DrawHands(const CCamera* cam, const HandVisual* hands, int numHands, const std::vector<float3>& selectionOutline, float lift, bool raysOnly = false)
 {
 	auto& rb = RenderBuffer::GetTypedRenderBuffer<VA_TYPE_C>();
 
@@ -1956,7 +2116,7 @@ static void DrawHands(const CCamera* cam, const HandVisual* hands, int numHands,
 	for (int h = 0; h < numHands; ++h) {
 		const HandVisual& hv = hands[h];
 
-		if (hv.gripValid) {
+		if (hv.gripValid && !raysOnly) {
 			const SColor axisCols[3] = {
 				hv.held ? SColor(255, 220, 80, 255) : SColor(230, 70, 60, 255),
 				hv.held ? SColor(255, 220, 80, 255) : SColor(80, 220, 90, 255),
@@ -2049,6 +2209,7 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 		// placement comes from impl->table (moved, turned and zoomed by the controllers)
 		const XrToWorld m = TableMapping(impl->table);
 		scale = m.scale;
+		VRState::eyeElmosPerMetre = scale;
 		origin = m.origin;
 		xrOrigin = m.xrOrigin;
 		axisX = m.axisX;
@@ -2167,6 +2328,10 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 			impl->eyeFrames, impl->tableView ? "table" : "camera", scale, a.x, a.y, a.z, ipd * 1000.0f, ipd * scale);
 	}
 
+	// the overlay layer is submitted only when both eyes got their image
+	uint32_t overlayCount = 0;
+	impl->overlayDrawn = false;
+
 	for (uint32_t i = 0; i < NUM_EYES && ok; ++i) {
 		const XrPosef& pose = impl->views[i].pose;
 		const XrFovf& fov = impl->views[i].fov;
@@ -2221,7 +2386,15 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 			CaptureBackBuffer("vr-eye-" + std::to_string(i) + ".png", cam->viewport[0], cam->viewport[1], cam->viewport[2], cam->viewport[3]);
 
 		ok = impl->CopyBackBufferTo(impl->eyes[i], cam->viewport[0], cam->viewport[1], cam->viewport[2], cam->viewport[3]);
+
+		// the pointer rays again, on a transparent layer submitted over the UI panels
+		if (ok && impl->inputReady && impl->tableView) {
+			const std::vector<float3> noOutline;
+			overlayCount += impl->DrawOverlay(i, [&]() { DrawHands(cam, handVisuals, CVRInput::NUM_HANDS, noOutline, 0.0f, true); }) ? 1 : 0;
+		}
 	}
+
+	impl->overlayDrawn = (overlayCount == NUM_EYES);
 
 	cam->vrOverride.active = false;
 	cam->SetPos(savedPos);

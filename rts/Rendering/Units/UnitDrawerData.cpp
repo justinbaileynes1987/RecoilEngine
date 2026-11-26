@@ -228,7 +228,9 @@ static void UpdateUnitIconStateVR(CUnit* unit)
 
 	// the same answer for both eyes (judged from the farther one), so a unit is
 	// never a model in one eye and an icon in the other
-	const float dist = VRState::IconSwitchDistance(unit->drawMidPos);
+	// (from the unit's own midpoint, where its icon is drawn: drawMidPos is the
+	// model's, which for some models lies far off, 2026-11-25: Zero-K's solar)
+	const float dist = VRState::IconSwitchDistance(unit->GetObjDrawMidPos());
 	unit->SetIsIcon(unit->radius < dist * VRState::iconSwitchTan);
 }
 
