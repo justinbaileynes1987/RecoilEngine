@@ -84,6 +84,7 @@ namespace {
 		std::vector<XrSwapchainImageOpenGLKHR> images;
 		int32_t sizeX = 0;
 		int32_t sizeY = 0;
+		bool released = false; // an image was released, so it can be submitted
 	};
 
 	// rotate v by unit quaternion q
@@ -390,6 +391,7 @@ struct CVRManager::Impl
 	}
 	// clear eye i's overlay image to transparent and run draw into it
 	bool DrawOverlay(uint32_t eye, const std::function<void()>& draw);
+	bool PrimeSwapchain(ColorSwapchain& sc);
 	void SubmitFrame(bool haveFrame);
 };
 
@@ -949,7 +951,9 @@ bool CVRManager::Impl::BlitResolvedTo(ColorSwapchain& sc, int srcX, int srcY, in
 	}
 
 	XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-	return Check(xrReleaseSwapchainImage(sc.handle, &releaseInfo), "xrReleaseSwapchainImage");
+	const bool ok = Check(xrReleaseSwapchainImage(sc.handle, &releaseInfo), "xrReleaseSwapchainImage");
+	sc.released |= ok;
+	return ok;
 }
 
 
@@ -990,7 +994,32 @@ bool CVRManager::Impl::DrawOverlay(uint32_t eye, const std::function<void()>& dr
 	}
 
 	XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-	return Check(xrReleaseSwapchainImage(sc.handle, &releaseInfo), "xrReleaseSwapchainImage (overlay)");
+	const bool ok = Check(xrReleaseSwapchainImage(sc.handle, &releaseInfo), "xrReleaseSwapchainImage (overlay)");
+	sc.released |= ok;
+	return ok;
+}
+
+
+// releases one image of a swapchain that has none yet, so a parked layer can
+// name it (its pixels never show)
+bool CVRManager::Impl::PrimeSwapchain(ColorSwapchain& sc)
+{
+	if (sc.handle == XR_NULL_HANDLE)
+		return false;
+	if (sc.released)
+		return true;
+
+	uint32_t imageIndex = 0;
+	XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+	if (!Check(xrAcquireSwapchainImage(sc.handle, &acquireInfo, &imageIndex), "xrAcquireSwapchainImage (prime)"))
+		return false;
+	XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+	waitInfo.timeout = XR_INFINITE_DURATION;
+	if (!Check(xrWaitSwapchainImage(sc.handle, &waitInfo), "xrWaitSwapchainImage (prime)"))
+		return false;
+	XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+	sc.released = Check(xrReleaseSwapchainImage(sc.handle, &releaseInfo), "xrReleaseSwapchainImage (prime)");
+	return sc.released;
 }
 
 
@@ -1808,7 +1837,22 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 	const bool resolved = frameState.shouldRender && haveFrame && (TVVisible(inGameView) || anyUI) && ResolveBackBuffer(0, 0, winX, winY);
 	const bool canvasReady = frameState.shouldRender && haveFrame && anyCanvas && RenderCanvas(winX, winY);
 
-	if (resolved && TVVisible(inGameView) && BlitResolvedTo(mirror, 0, 0, winX, winY)) {
+	// SteamVR shows a quad layer that changes swapchain between frames (in the
+	// same place of the layer list) cropped and stretched to the previous
+	// swapchain's size: seen in the headset 2026-11-25 as the side panel and
+	// the menu zoomed in on their bottom left, coming and going as the TV or a
+	// panel was shown or hidden (which moved the later layers). So in the game
+	// view every quad keeps its place: one that is not shown is still
+	// submitted, "parked" (a millimetre across, far below the floor).
+	const auto Park = [](XrCompositionLayerQuad& quad) {
+		quad.pose = {};
+		quad.pose.orientation.w = 1.0f;
+		quad.pose.position = {0.0f, -1000.0f, 0.0f};
+		quad.size = {0.001f, 0.001f};
+	};
+
+	const bool tvOn = resolved && TVVisible(inGameView) && BlitResolvedTo(mirror, 0, 0, winX, winY);
+	if (tvOn || (frameState.shouldRender && inGameView && PrimeSwapchain(mirror))) {
 		panel.space = localSpace;
 		panel.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
 		panel.subImage.swapchain = mirror.handle;
@@ -1816,10 +1860,14 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 		panel.subImage.imageRect.extent = {mirror.sizeX, mirror.sizeY};
 		panel.subImage.imageArrayIndex = 0;
 
-		float3 center;
-		PanelRect(eyesDrawn && tableView, center, panel.size.width, panel.size.height);
-		panel.pose.orientation.w = 1.0f;
-		panel.pose.position = {center.x, center.y, center.z};
+		if (tvOn) {
+			float3 center;
+			PanelRect(eyesDrawn && tableView, center, panel.size.width, panel.size.height);
+			panel.pose.orientation.w = 1.0f;
+			panel.pose.position = {center.x, center.y, center.z};
+		} else {
+			Park(panel);
+		}
 
 		layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&panel);
 	}
@@ -1836,16 +1884,34 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 
 	int uiCount = 0;
 	for (UIPanelLayer& layer: uiLayers) {
-		if (!layer.visible || uiCount >= MAX_UI_LAYERS || !(layer.canvas ? canvasReady : resolved))
-			continue;
+		if (!frameState.shouldRender || !inGameView || uiCount >= MAX_UI_LAYERS)
+			break;
 
 		// made by EnsureUISwapchains, outside the frame's drawing
 		if (layer.sc.handle == XR_NULL_HANDLE || layer.sc.sizeX != layer.w || layer.sc.sizeY != layer.h)
 			continue;
 
 		// window rows count down from the top; GL rows count up from the bottom
-		if (!BlitResolvedTo(layer.sc, layer.x, winY - (layer.y + layer.h), layer.w, layer.h, layer.canvas ? canvasFBO : 0))
+		const bool show = layer.visible && (layer.canvas ? canvasReady : resolved) &&
+			BlitResolvedTo(layer.sc, layer.x, winY - (layer.y + layer.h), layer.w, layer.h, layer.canvas ? canvasFBO : 0);
+
+		if (!show) {
+			if (!PrimeSwapchain(layer.sc))
+				continue;
+			XrCompositionLayerQuad& quad = uiQuads[uiCount++];
+			quad = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+			quad.space = localSpace;
+			quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+			quad.subImage.swapchain = layer.sc.handle;
+			quad.subImage.imageRect.offset = {0, 0};
+			quad.subImage.imageRect.extent = {layer.sc.sizeX, layer.sc.sizeY};
+			quad.subImage.imageArrayIndex = 0;
+			if (layer.canvas)
+				quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+			Park(quad);
+			layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
 			continue;
+		}
 
 		XrCompositionLayerQuad& quad = uiQuads[uiCount++];
 		quad = {XR_TYPE_COMPOSITION_LAYER_QUAD};
