@@ -341,6 +341,7 @@ struct CVRManager::Impl
 	int swapchainRetryIn = 0;     // frames until the next try after a failure
 	int uiPanelsVersionSeen = -1;
 	bool uiPanelsMenuSeen = false; // uiLayers came from LuaMenu's list (VRState::menuPanels)
+	bool uiPanelsSourceKnown = false;
 	bool uiPanelsEnabled = true;  // VRUIPanels
 	std::string lastPanelLogged;  // pointer log: the panel last reported under the pointer
 	bool paletteShown = false;    // the off-hand palette is up (hand raised, with hysteresis)
@@ -705,6 +706,7 @@ void CVRManager::Impl::Destroy()
 	swapchainFailures = 0;
 	swapchainRetryIn = 0;
 	uiPanelsVersionSeen = -1;
+	uiPanelsSourceKnown = false;
 
 	input.Destroy();
 	inputReady = false;
@@ -1168,6 +1170,12 @@ void CVRManager::Impl::SyncUIPanels()
 	if (uiPanelsVersionSeen == version && uiPanelsMenuSeen == menuView)
 		return;
 
+	// the other Lua state's set (LuaMenu's after a game, LuaUI's after the
+	// menu): its swapchains are destroyed rather than kept as spares, so no
+	// image of the menu's panels can come back in a game, or the reverse
+	const bool sourceChanged = (uiPanelsMenuSeen != menuView) || !uiPanelsSourceKnown;
+	uiPanelsSourceKnown = true;
+
 	uiPanelsVersionSeen = version;
 	uiPanelsMenuSeen = menuView;
 
@@ -1213,10 +1221,24 @@ void CVRManager::Impl::SyncUIPanels()
 		next.push_back(std::move(layer));
 	}
 
-	// dropped panels keep their swapchains for when they come back
+	if (sourceChanged) {
+		for (auto& spare: uiSpare) {
+			if (spare.second.handle != XR_NULL_HANDLE)
+				xrDestroySwapchain(spare.second.handle);
+		}
+		uiSpare.clear();
+	}
+
+	// dropped panels keep their swapchains for when they come back (within
+	// the same Lua state's set)
 	for (UIPanelLayer& layer: uiLayers) {
 		if (layer.sc.handle == XR_NULL_HANDLE)
 			continue;
+		if (sourceChanged) {
+			xrDestroySwapchain(layer.sc.handle);
+			layer.sc = ColorSwapchain();
+			continue;
+		}
 		const auto spare = std::find_if(uiSpare.begin(), uiSpare.end(), [&](const auto& s) { return s.first == layer.name; });
 		if (spare != uiSpare.end()) {
 			xrDestroySwapchain(spare->second.handle);
@@ -1227,13 +1249,9 @@ void CVRManager::Impl::SyncUIPanels()
 	}
 
 	uiLayers = std::move(next);
-	LOG_L(L_DEBUG, "[VR] UI panels:%s", summary.empty() ? " none" : summary.c_str());
 
-	static bool loggedFirst = false;
-	if (!loggedFirst && !uiLayers.empty()) {
-		LOG("[VR] UI panels from %s:%s (pointer-hand thumbstick click hides or shows the big desktop panel)", menuView ? "LuaMenu" : "LuaUI", summary.c_str());
-		loggedFirst = true;
-	}
+	// every change of the set (rare: a screen change, a panel shown or hidden)
+	LOG("[VR] UI panels from %s:%s", menuView ? "LuaMenu" : "LuaUI", summary.empty() ? " none" : summary.c_str());
 }
 
 
