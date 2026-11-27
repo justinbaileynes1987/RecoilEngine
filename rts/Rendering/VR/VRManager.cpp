@@ -363,6 +363,11 @@ struct CVRManager::Impl
 	float sideMaxAngle = 1.745f; // radians
 	float sideAngleNow = 0.0f;  // the angle in use, eased towards the clearest one
 	float sideLiftNow = 0.0f;   // metres raised above VRSideHeight to clear the table, eased
+	// the player is using the side panel (looking or pointing at it): it holds still
+	bool sideEngaged = false;
+	bool sideCenterValid = false;
+	float3 sideCenter;          // where it stood last frame
+	bool pointerOnSide = false; // the pointer was on a side panel last frame
 	bool sideAngleValid = false;
 	// centre panels (the menu): placed when they appear, fixed until hidden
 	bool centerValid = false;
@@ -1435,14 +1440,41 @@ void CVRManager::Impl::LayoutUIPanels()
 				sideValid = true;
 			}
 
-			// the yaw the panel is anchored to: pulled along only by the part of
-			// the head turn beyond the dead zone, eased
-			const float diff = WrapAngle(headYaw - sideYaw);
-			if (std::abs(diff) > SIDE_DEADZONE) {
-				const float excess = diff - std::copysign(SIDE_DEADZONE, diff);
-				sideYaw = WrapAngle(sideYaw + excess * 0.25f);
+			// in use: while you look at the panel (its middle within its own half
+			// width plus a margin of where you face) or point at it, it holds still,
+			// so turning to it never makes it run away (2026-11-27). It lets go
+			// once you look clearly away (a wider margin, so it doesn't flicker).
+			{
+				float panelW = 0.0f;
+				for (const UIPanelLayer& layer: uiLayers) {
+					if (layer.anchor == VRState::UI_ANCHOR_SIDE && !layer.hidden)
+						panelW = std::max(panelW, layer.w * Scale(layer, sideScale));
+				}
+				bool looking = false;
+				float3 toPanel = sideCenter - head;
+				toPanel.y = 0.0f;
+				if (sideCenterValid && toPanel.SqLength() > 1e-4f) {
+					const float off = std::abs(WrapAngle(YawOf(toPanel) - headYaw));
+					const float halfAngle = std::atan2(panelW * 0.5f, toPanel.Length());
+					const float margin = (sideEngaged ? 20.0f : 8.0f) * 0.0174533f;
+					looking = off < halfAngle + margin;
+				}
+				const bool engaged = looking || pointerOnSide;
+				if (engaged != sideEngaged)
+					LOG("[VR] side panel %s", engaged ? "held (in use)" : "following again");
+				sideEngaged = engaged;
 			}
-			sidePos = sidePos + (head - sidePos) * 0.1f;
+
+			// the yaw the panel is anchored to: pulled along only by the part of
+			// the head turn beyond the dead zone, eased; not while in use
+			if (!sideEngaged) {
+				const float diff = WrapAngle(headYaw - sideYaw);
+				if (std::abs(diff) > SIDE_DEADZONE) {
+					const float excess = diff - std::copysign(SIDE_DEADZONE, diff);
+					sideYaw = WrapAngle(sideYaw + excess * 0.25f);
+				}
+				sidePos = sidePos + (head - sidePos) * 0.1f;
+			}
 
 			// on the pointer hand's side, within easy reach of the pointer: pointer
 			// hand right (1), the panel goes to the right (clockwise, negative yaw).
@@ -1514,10 +1546,14 @@ void CVRManager::Impl::LayoutUIPanels()
 				sideLiftNow = bestLift;
 				sideAngleValid = true;
 			}
-			sideAngleNow += (bestAngle - sideAngleNow) * 0.06f;
-			sideLiftNow += (bestLift - sideLiftNow) * 0.06f;
+			if (!sideEngaged) {
+				sideAngleNow += (bestAngle - sideAngleNow) * 0.06f;
+				sideLiftNow += (bestLift - sideLiftNow) * 0.06f;
+			}
 
 			const SidePlace place = Place(sideAngleNow, sideLiftNow);
+			sideCenter = place.base;
+			sideCenterValid = true;
 			const float3 base = place.base;
 			const XrQuaternionf q = place.q;
 			const float3 up = ToF3(Rotate(q, {0.0f, 1.0f, 0.0f}));
@@ -1660,6 +1696,8 @@ void CVRManager::Impl::LayoutUIPanels()
 
 void CVRManager::Impl::UpdatePointer()
 {
+	pointerOnSide = false; // set again below when the pointer is on a side panel
+
 	pointerHit = 0;
 
 	// debounce the buttons and find this frame's presses
@@ -1792,6 +1830,8 @@ void CVRManager::Impl::UpdatePointer()
 				if (layer.visible && layer.drawn && TryPanel(layer.quad, layer.x, layer.y, layer.w, layer.h, layer.canvas))
 					hitPanel = &layer;
 			}
+
+			pointerOnSide = (hitPanel != nullptr) && (hitPanel->anchor == VRState::UI_ANCHOR_SIDE);
 
 			// pointer log (see VRPointer.cpp): which panel takes the pointer, on change
 			const std::string hitName = (hitPanel != nullptr) ? hitPanel->name : (panelT > 0.0f ? std::string("tv") : std::string());
