@@ -210,7 +210,7 @@ namespace {
 
 	// UI panel quad layers per frame; with the eye layer and the desktop panel
 	// this stays under the 16 layers every OpenXR runtime must support
-	constexpr int MAX_UI_LAYERS = 8;
+	constexpr int MAX_UI_LAYERS = 10; // panels per session (LuaMenu's and LuaUI's together)
 
 	constexpr float MIN_TABLE_SIZE = 0.2f;   // metres
 	constexpr float MAX_TABLE_SIZE = 200.0f; // metres; large enough to stand inside a base
@@ -341,7 +341,9 @@ struct CVRManager::Impl
 	int swapchainRetryIn = 0;     // frames until the next try after a failure
 	int uiPanelsVersionSeen = -1;
 	bool uiPanelsMenuSeen = false; // uiLayers came from LuaMenu's list (VRState::menuPanels)
-	bool uiPanelsSourceKnown = false;
+	// every panel name seen this session, in first-seen order: its place in
+	// the headset's layer list, for good (see SubmitFrame)
+	std::vector<std::string> slotNames;
 	bool uiPanelsEnabled = true;  // VRUIPanels
 	std::string lastPanelLogged;  // pointer log: the panel last reported under the pointer
 	bool paletteShown = false;    // the off-hand palette is up (hand raised, with hysteresis)
@@ -706,7 +708,7 @@ void CVRManager::Impl::Destroy()
 	swapchainFailures = 0;
 	swapchainRetryIn = 0;
 	uiPanelsVersionSeen = -1;
-	uiPanelsSourceKnown = false;
+	slotNames.clear();
 
 	input.Destroy();
 	inputReady = false;
@@ -1170,12 +1172,6 @@ void CVRManager::Impl::SyncUIPanels()
 	if (uiPanelsVersionSeen == version && uiPanelsMenuSeen == menuView)
 		return;
 
-	// the other Lua state's set (LuaMenu's after a game, LuaUI's after the
-	// menu): its swapchains are destroyed rather than kept as spares, so no
-	// image of the menu's panels can come back in a game, or the reverse
-	const bool sourceChanged = (uiPanelsMenuSeen != menuView) || !uiPanelsSourceKnown;
-	uiPanelsSourceKnown = true;
-
 	uiPanelsVersionSeen = version;
 	uiPanelsMenuSeen = menuView;
 
@@ -1207,6 +1203,9 @@ void CVRManager::Impl::SyncUIPanels()
 			}
 		}
 
+		if (std::find(slotNames.begin(), slotNames.end(), req.name) == slotNames.end())
+			slotNames.push_back(req.name);
+
 		layer.name = req.name;
 		layer.anchor = req.anchor;
 		layer.canvas = req.canvas;
@@ -1221,24 +1220,11 @@ void CVRManager::Impl::SyncUIPanels()
 		next.push_back(std::move(layer));
 	}
 
-	if (sourceChanged) {
-		for (auto& spare: uiSpare) {
-			if (spare.second.handle != XR_NULL_HANDLE)
-				xrDestroySwapchain(spare.second.handle);
-		}
-		uiSpare.clear();
-	}
-
-	// dropped panels keep their swapchains for when they come back (within
-	// the same Lua state's set)
+	// dropped panels keep their swapchains for when they come back; SubmitFrame
+	// keeps submitting them, parked, in their own place (see slotNames)
 	for (UIPanelLayer& layer: uiLayers) {
 		if (layer.sc.handle == XR_NULL_HANDLE)
 			continue;
-		if (sourceChanged) {
-			xrDestroySwapchain(layer.sc.handle);
-			layer.sc = ColorSwapchain();
-			continue;
-		}
 		const auto spare = std::find_if(uiSpare.begin(), uiSpare.end(), [&](const auto& s) { return s.first == layer.name; });
 		if (spare != uiSpare.end()) {
 			xrDestroySwapchain(spare->second.handle);
@@ -1435,7 +1421,7 @@ void CVRManager::Impl::LayoutUIPanels()
 		}
 
 		if (totalH > 0.0f && viewsValid) {
-			constexpr float SIDE_DEADZONE = 35.0f * 0.0174533f;
+			constexpr float SIDE_DEADZONE = 20.0f * 0.0174533f;
 			constexpr float GAP = 0.015f;
 			constexpr float LEAN = 20.0f * 0.0174533f;
 
@@ -1454,7 +1440,7 @@ void CVRManager::Impl::LayoutUIPanels()
 			const float diff = WrapAngle(headYaw - sideYaw);
 			if (std::abs(diff) > SIDE_DEADZONE) {
 				const float excess = diff - std::copysign(SIDE_DEADZONE, diff);
-				sideYaw = WrapAngle(sideYaw + excess * 0.15f);
+				sideYaw = WrapAngle(sideYaw + excess * 0.25f);
 			}
 			sidePos = sidePos + (head - sidePos) * 0.1f;
 
@@ -1505,27 +1491,22 @@ void CVRManager::Impl::LayoutUIPanels()
 				return hits;
 			};
 
-			// the first place that keeps the table clear: round from VRSideAngle
-			// to VRSideMaxAngle at the normal height, then the same raised in
-			// steps up to eye level (the rays then pass over the table). If none
-			// is clear, the one that hides the least. Eased, so the panel glides.
-			constexpr float STEP = 10.0f * 0.0174533f;
-			constexpr float LIFT_STEP = 0.15f;
+			// it stays at VRSideAngle beside you (the user wades through the
+			// battlefield, so going round the table made them turn far too much,
+			// 2026-11-27) and rises in steps, up to eye level, until it hides none
+			// of the table (the rays then pass over the table). If no height is
+			// clear, the one that hides the least. Eased, so the panel glides.
+			constexpr float LIFT_STEP = 0.05f;
 			const float maxLift = std::max(0.0f, -sideHeight + totalH * 0.5f);
-			float bestAngle = sideAngle;
+			const float bestAngle = sideAngle;
 			float bestLift = 0.0f;
 			int bestHits = 1 << 30;
 			for (float lift = 0.0f; lift <= maxLift + LIFT_STEP - 1e-3f && bestHits > 0; lift += LIFT_STEP) {
 				const float l = std::min(lift, maxLift);
-				for (float a = sideAngle; a <= sideMaxAngle + 1e-3f; a += STEP) {
-					const int hits = Blocked(Place(a, l));
-					if (hits < bestHits) {
-						bestHits = hits;
-						bestAngle = a;
-						bestLift = l;
-					}
-					if (hits == 0)
-						break;
+				const int hits = Blocked(Place(bestAngle, l));
+				if (hits < bestHits) {
+					bestHits = hits;
+					bestLift = l;
 				}
 			}
 			if (!sideAngleValid) {
@@ -1993,10 +1974,36 @@ void CVRManager::Impl::SubmitFrame(bool haveFrame)
 		}
 	}
 
+	// every panel of the session keeps one place in the layer list, whichever
+	// Lua state's set is up: SteamVR shows a place whose swapchain changes
+	// stretched to the old swapchain's size, with old content (seen 2026-11-27:
+	// the menu's panel came back in games, in the bar's place, and the command
+	// panel was cut to the menu pop-up's size). Panels of the other set are
+	// parked in their places with their own swapchains.
 	int uiCount = 0;
-	for (UIPanelLayer& layer: uiLayers) {
+	for (const std::string& slotName: slotNames) {
 		if (!frameState.shouldRender || !inGameView || uiCount >= MAX_UI_LAYERS)
 			break;
+
+		const auto active = std::find_if(uiLayers.begin(), uiLayers.end(), [&](const UIPanelLayer& l) { return l.name == slotName; });
+		if (active == uiLayers.end()) {
+			const auto spare = std::find_if(uiSpare.begin(), uiSpare.end(), [&](const auto& sp) { return sp.first == slotName; });
+			if (spare == uiSpare.end() || !PrimeSwapchain(spare->second))
+				continue;
+			XrCompositionLayerQuad& quad = uiQuads[uiCount++];
+			quad = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+			quad.space = localSpace;
+			quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+			quad.subImage.swapchain = spare->second.handle;
+			quad.subImage.imageRect.offset = {0, 0};
+			quad.subImage.imageRect.extent = {spare->second.sizeX, spare->second.sizeY};
+			quad.subImage.imageArrayIndex = 0;
+			quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+			Park(quad);
+			layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
+			continue;
+		}
+		UIPanelLayer& layer = *active;
 
 		// made by EnsureUISwapchains, outside the frame's drawing
 		if (layer.sc.handle == XR_NULL_HANDLE || layer.sc.sizeX != layer.w || layer.sc.sizeY != layer.h)
