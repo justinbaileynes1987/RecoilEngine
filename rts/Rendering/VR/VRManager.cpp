@@ -1747,8 +1747,24 @@ void CVRManager::Impl::UpdatePointer()
 		shift |= (triggerRole[h] == TRIGGER_SHIFT);
 	}
 
-	// the lobby has no orders to queue
-	VRPointer::SetShift(shift && !menuView);
+	// the off hand's B/Y holds Ctrl and the pointer hand's holds Alt, as the
+	// off-hand trigger holds Shift (the lobby has no orders to queue)
+	const bool ctrl = input.Hand(1 - pointerHand).secondary;
+	const bool alt = input.Hand(pointerHand).secondary;
+	VRPointer::SetModifiers(shift && !menuView, ctrl && !menuView, alt && !menuView);
+
+	for (int h = 0; h < CVRInput::NUM_HANDS; ++h) {
+		const VRHandState& hs = input.Hand(h);
+		VRState::HandInput& hi = VRState::handInput[h];
+		hi.valid = hs.aimValid || hs.gripValid;
+		hi.trigger = hs.trigger;
+		hi.grip = hs.squeeze;
+		hi.stickX = hs.thumbstick.x;
+		hi.stickY = hs.thumbstick.y;
+		hi.primary = hs.command;
+		hi.secondary = hs.secondary;
+		hi.stickClick = hs.stickClick;
+	}
 
 	const VRHandState& hand = input.Hand(pointerHand);
 

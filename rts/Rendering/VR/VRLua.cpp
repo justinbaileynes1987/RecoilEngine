@@ -3,6 +3,7 @@
 #include "VRLua.h"
 
 #include <cstring>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -150,6 +151,41 @@ namespace {
 	}
 
 	/***
+	 * Zero-K VR: the controllers' buttons and thumbsticks this frame. The
+	 * engine already uses the triggers, A/X, grips, thumbstick clicks and B/Y
+	 * (Ctrl on the off hand, Alt on the pointer hand); the thumbsticks are
+	 * free in a game, for LuaUI to use.
+	 *
+	 * @function Spring.GetVRControllers
+	 * @return nil|table {pointer = "left"|"right", left = hand, right = hand}, where hand is
+	 *   {valid, trigger, grip, stickX, stickY, primary (A/X), secondary (B/Y), stickClick};
+	 *   nil while no headset session runs
+	 */
+	int GetVRControllers(lua_State* L)
+	{
+		if (!VRState::sessionRunning)
+			return 0;
+
+		lua_createtable(L, 0, 3);
+		LuaPushNamedString(L, "pointer", std::string((VRState::pointerHand == 0) ? "left" : "right"));
+		for (int h = 0; h < 2; ++h) {
+			const VRState::HandInput& hi = VRState::handInput[h];
+			lua_pushstring(L, (h == 0) ? "left" : "right");
+			lua_createtable(L, 0, 8);
+			LuaPushNamedBool(L, "valid", hi.valid);
+			LuaPushNamedNumber(L, "trigger", hi.trigger);
+			LuaPushNamedNumber(L, "grip", hi.grip);
+			LuaPushNamedNumber(L, "stickX", hi.stickX);
+			LuaPushNamedNumber(L, "stickY", hi.stickY);
+			LuaPushNamedBool(L, "primary", hi.primary);
+			LuaPushNamedBool(L, "secondary", hi.secondary);
+			LuaPushNamedBool(L, "stickClick", hi.stickClick);
+			lua_rawset(L, -3);
+		}
+		return 1;
+	}
+
+	/***
 	 * Zero-K VR: shows or hides the big desktop panel (TV), as the pointer
 	 * hand's thumbstick click does.
 	 *
@@ -213,6 +249,7 @@ bool VRLua::PushEntries(lua_State* L)
 {
 	REGISTER_LUA_CFUNC(SetVRPanels);
 	REGISTER_LUA_CFUNC(GetVRView);
+	REGISTER_LUA_CFUNC(GetVRControllers);
 	REGISTER_LUA_CFUNC(SetVRTVShown);
 	return true;
 }

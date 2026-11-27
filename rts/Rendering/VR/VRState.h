@@ -91,6 +91,21 @@ namespace VRState {
 	// CVRManager for Spring.GetVRView
 	inline int pointerHand = 1;
 
+	// each controller's buttons and thumbstick this frame (0 left, 1 right),
+	// mirrored by CVRManager for Spring.GetVRControllers (LuaUI reads the
+	// off-hand thumbstick to turn a building while placing it)
+	struct HandInput {
+		bool valid = false;
+		float trigger = 0.0f;
+		float grip = 0.0f;
+		float stickX = 0.0f;
+		float stickY = 0.0f;
+		bool primary = false;    // A / X
+		bool secondary = false;  // B / Y
+		bool stickClick = false;
+	};
+	inline HandInput handInput[2];
+
 	// the big desktop panel (TV) is shown while UI panels exist: the pointer
 	// hand's thumbstick click or Spring.SetVRTVShown toggles it
 	inline bool tvShown = true;

@@ -57,11 +57,12 @@ namespace VRPointer {
 	// Call while the player camera still has its desktop pose.
 	bool SelectionFootprint(std::vector<float3>& outline);
 
-	// holds Shift down (queue orders) while true, as if the key were held on
-	// the keyboard: the key state, plus the press and release events
+	// hold Shift (queue orders), Ctrl and Alt down while true, as if the keys
+	// were held on the keyboard: the key state, plus the press and release events
 	void SetShift(bool down);
+	void SetModifiers(bool shift, bool ctrl, bool alt);
 
-	// let go of any button the pointer is holding down, and of Shift
+	// let go of any button the pointer is holding down, and of the modifiers
 	void Release();
 
 	// mouse-wheel steps at the cursor (thumbstick scrolling on the desktop

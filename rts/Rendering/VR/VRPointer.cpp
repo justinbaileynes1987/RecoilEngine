@@ -46,6 +46,8 @@ namespace {
 	int anchorX = 0;
 	int anchorY = 0;
 	bool shiftDown = false; // the pointer is holding Shift
+	bool ctrlDown = false;  // ... Ctrl (off-hand B/Y)
+	bool altDown = false;   // ... Alt (pointer-hand B/Y)
 
 	// pointer log: picks that end in mid-air (headset reports of a pointer
 	// "blocked by something invisible"), at most every half second or so
@@ -219,44 +221,60 @@ bool VRPointer::SelectionFootprint(std::vector<float3>& outline)
 }
 
 
+namespace {
+	// holds an emulated modifier key down or lets it go: the same path as
+	// debug.emulateKeyPress/Release. The emulated key is merged with the real
+	// keyboard in KeyInput::Update, so GetKeyModState, Lua's GetModKeyState
+	// and the queue-order logic all see it held
+	void SetModifierKey(SDL_Keycode key, bool down, bool& state)
+	{
+		if (down == state)
+			return;
+
+		state = down;
+
+		const SDL_Scancode sc = SDL_GetScancodeFromKey(key);
+
+		int numKeys = 0;
+		const uint8_t* kbState = SDL_GetKeyboardState(&numKeys);
+		const bool physicalDown = (kbState != nullptr && static_cast<int>(sc) < numKeys && kbState[sc] != 0);
+
+		KeyInput::SetKeyEmulated(key, down);
+		KeyInput::Update(keyBindings.GetFakeMetaKey());
+
+		// press and release events, unless the real key is already down
+		if (activeController == nullptr || physicalDown)
+			return;
+
+		const int keyCode = CKeyCodes::GetNormalizedSymbol(key);
+		const int scanCode = CScanCodes::GetNormalizedSymbol(sc);
+
+		if (down) {
+			activeController->KeyPressed(keyCode, scanCode, false);
+		} else {
+			activeController->KeyReleased(keyCode, scanCode);
+		}
+	}
+}
+
+
 void VRPointer::SetShift(bool down)
 {
-	if (down == shiftDown)
-		return;
+	SetModifierKey(SDLK_LSHIFT, down, shiftDown);
+}
 
-	shiftDown = down;
 
-	// the same path as debug.emulateKeyPress/Release: the emulated key is merged
-	// with the real keyboard in KeyInput::Update, so GetKeyModState, Lua's
-	// GetModKeyState and the queue-order logic all see Shift held
-	constexpr SDL_Keycode key = SDLK_LSHIFT;
-	const SDL_Scancode sc = SDL_GetScancodeFromKey(key);
-
-	int numKeys = 0;
-	const uint8_t* kbState = SDL_GetKeyboardState(&numKeys);
-	const bool physicalDown = (kbState != nullptr && static_cast<int>(sc) < numKeys && kbState[sc] != 0);
-
-	KeyInput::SetKeyEmulated(key, down);
-	KeyInput::Update(keyBindings.GetFakeMetaKey());
-
-	// press and release events, unless the real Shift key is already down
-	if (activeController == nullptr || physicalDown)
-		return;
-
-	const int keyCode = CKeyCodes::GetNormalizedSymbol(key);
-	const int scanCode = CScanCodes::GetNormalizedSymbol(sc);
-
-	if (down) {
-		activeController->KeyPressed(keyCode, scanCode, false);
-	} else {
-		activeController->KeyReleased(keyCode, scanCode);
-	}
+void VRPointer::SetModifiers(bool shift, bool ctrl, bool alt)
+{
+	SetModifierKey(SDLK_LSHIFT, shift, shiftDown);
+	SetModifierKey(SDLK_LCTRL, ctrl, ctrlDown);
+	SetModifierKey(SDLK_LALT, alt, altDown);
 }
 
 
 void VRPointer::Release()
 {
-	SetShift(false);
+	SetModifiers(false, false, false);
 	VRState::cursorPick.active = false;
 
 	if (mouse == nullptr) {
