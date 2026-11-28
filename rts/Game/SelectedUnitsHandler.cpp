@@ -44,6 +44,7 @@
 #include <SDL_keycode.h>
 
 #include "System/Misc/TracyDefs.h"
+#include "Rendering/VR/VRState.h"
 
 
 
@@ -377,7 +378,9 @@ void CSelectedUnitsHandler::HandleSingleUnitClickSelection(CUnit* unit, bool doI
 				if (u->unitDef->id != unit->unitDef->id)
 					continue;
 
-				if (!doInViewTest || KeyInput::GetKeyModState(KMOD_CTRL) || camera->InView((u)->midPos))
+				// Zero-K VR: in view of the headset while one shows the game
+				const int vrInView = VRState::InHeadView(u->midPos);
+				if (!doInViewTest || KeyInput::GetKeyModState(KMOD_CTRL) || ((vrInView >= 0) ? (vrInView == 1) : camera->InView((u)->midPos)))
 					AddUnit(u);
 			}
 		}

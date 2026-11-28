@@ -2643,6 +2643,21 @@ void CVRManager::DrawEyes(const std::function<void()>& updateForCamera, const st
 	for (uint32_t i = 0; i < NUM_EYES; ++i)
 		VRState::eyePos[i] = ToWorldPos(impl->views[i].pose.position);
 
+	// the head's view, for selecting what is in view (VRState::InHeadView)
+	{
+		VRState::HeadView& hv = VRState::headView;
+		const XrQuaternionf& o = impl->views[0].pose.orientation;
+		hv.pos     = (VRState::eyePos[0] + VRState::eyePos[1]) * 0.5f;
+		hv.forward = ToWorldDir(Rotate(o, {0.0f, 0.0f, -1.0f})).SafeNormalize();
+		hv.up      = ToWorldDir(Rotate(o, {0.0f, 1.0f,  0.0f})).SafeNormalize();
+		hv.right   = ToWorldDir(Rotate(o, {1.0f, 0.0f,  0.0f})).SafeNormalize();
+		hv.tanLeft  = std::min(std::tan(impl->views[0].fov.angleLeft),  std::tan(impl->views[1].fov.angleLeft));
+		hv.tanRight = std::max(std::tan(impl->views[0].fov.angleRight), std::tan(impl->views[1].fov.angleRight));
+		hv.tanDown  = std::min(std::tan(impl->views[0].fov.angleDown),  std::tan(impl->views[1].fov.angleDown));
+		hv.tanUp    = std::max(std::tan(impl->views[0].fov.angleUp),    std::tan(impl->views[1].fov.angleUp));
+		hv.valid = impl->tableView;
+	}
+
 	// keep the desktop camera for screen<->world queries made while the eyes
 	// are drawn (the mouse, Spring.TraceScreenRay, area-command previews)
 	static CCamera desktopCamera;

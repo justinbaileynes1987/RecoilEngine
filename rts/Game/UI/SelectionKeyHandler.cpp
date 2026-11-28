@@ -22,6 +22,15 @@
 #include "System/UnorderedSet.hpp"
 
 #include "System/Misc/TracyDefs.h"
+#include "Rendering/VR/VRState.h"
+
+// Zero-K VR: "Visible" means in the headset's view while one shows the game
+// (the desktop camera is held over the whole map then)
+static bool InViewVR(const float3& pos, float radius)
+{
+	const int vr = VRState::InHeadView(pos, radius);
+	return (vr >= 0) ? (vr == 1) : camera->InView(pos, radius);
+}
 
 CSelectionKeyHandler selectionKeys;
 
@@ -310,7 +319,7 @@ void CSelectionKeyHandler::DoSelection(std::string selectString)
 				selection.reserve(unitHandler.NumUnitsByTeam(gu->myTeam));
 
 				for (CUnit* unit: unitHandler.GetUnitsByTeam(gu->myTeam)) {
-					if (!camera->InView(unit->midPos, unit->radius))
+					if (!InViewVR(unit->midPos, unit->radius))
 						continue;
 
 					selection.push_back(unit);
@@ -320,7 +329,7 @@ void CSelectionKeyHandler::DoSelection(std::string selectString)
 				selection.reserve((unitHandler.GetActiveUnits()).size());
 
 				for (CUnit* unit: unitHandler.GetActiveUnits()) {
-					if (!camera->InView(unit->midPos, unit->radius))
+					if (!InViewVR(unit->midPos, unit->radius))
 						continue;
 
 					selection.push_back(unit);

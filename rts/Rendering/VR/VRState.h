@@ -153,4 +153,40 @@ namespace VRState {
 	// is the active controller (the menu, the loading screen, pregame)
 	inline bool sessionRunning = false;
 	inline bool menuView = false;
+
+	// the headset's view in world space (head position, axes, and the tangents
+	// of the field of view both eyes together cover), set by CVRManager::DrawEyes
+	// each frame a game's eyes are drawn
+	struct HeadView {
+		bool valid = false;
+		float3 pos;
+		float3 forward;
+		float3 up;
+		float3 right;
+		float tanLeft = -1.0f;  // negative: left of forward
+		float tanRight = 1.0f;
+		float tanDown = -1.0f;  // negative: below forward
+		float tanUp = 1.0f;
+	};
+	inline HeadView headView;
+
+	// "in view" for selection (double-click on a unit, "select Visible"): the
+	// desktop camera is held over the whole map in VR, so while a headset
+	// shows the game it means the headset's view. -1: no headset view, use the
+	// camera; 0: out of view; 1: in view (a sphere of the radius touching it)
+	inline int InHeadView(const float3& p, float radius = 0.0f) {
+		if (!headView.valid || !sessionRunning || menuView)
+			return -1;
+		const HeadView& h = headView;
+		const float3 d = p - h.pos;
+		const float z = d.dot(h.forward);
+		if (z <= -radius)
+			return 0;
+		const float zz = std::max(z, 1.0f);
+		const float x = d.dot(h.right);
+		const float y = d.dot(h.up);
+		const bool inX = (x + radius >= h.tanLeft * zz) && (x - radius <= h.tanRight * zz);
+		const bool inY = (y + radius >= h.tanDown * zz) && (y - radius <= h.tanUp * zz);
+		return (inX && inY) ? 1 : 0;
+	}
 }
