@@ -2004,6 +2004,7 @@ void CVRManager::Impl::UpdatePointer()
 	pointerOnSide = false; // set again below when the pointer is on a side panel
 
 	pointerHit = 0;
+	VRState::uiPointerOn = false; // set again below while it is on a VR UI panel
 
 	for (const VRState::HapticRequest& r: VRState::haptics)
 		input.Pulse(session, r.hand, r.amplitude, r.seconds);
@@ -2174,6 +2175,13 @@ void CVRManager::Impl::UpdatePointer()
 	const bool wants[2] = {in.left, in.right};
 	const bool uiHeld = uiButtons[0] || uiButtons[1];
 	const bool toUI = uiHeld || (!worldHeld && onCanvas);
+
+	// for the VR UI's own cursor (drawn by LuaUI in the canvas)
+	VRState::uiPointerOn = toUI && onCanvas;
+	if (VRState::uiPointerOn) {
+		VRState::uiPointerX = in.panelX;
+		VRState::uiPointerY = in.panelY;
+	}
 
 	if (toUI) {
 		if (onCanvas) {

@@ -171,6 +171,11 @@ namespace VRState {
 	inline std::vector<std::string> pinnedNames;
 	// what each hand's grip holds: 0 nothing, 1 the table, 2 a panel
 	inline int handHolds[2] = {0, 0};
+	// where the pointer is on the VR UI canvas (canvas px, top left 0, 0) while
+	// it points at a VR UI panel; LuaUI draws its cursor there
+	inline bool uiPointerOn = false;
+	inline int uiPointerX = 0;
+	inline int uiPointerY = 0;
 
 	// the headset's view in world space (head position, axes, and the tangents
 	// of the field of view both eyes together cover), set by CVRManager::DrawEyes

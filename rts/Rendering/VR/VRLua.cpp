@@ -225,7 +225,8 @@ namespace {
 	 * @function Spring.GetVRControllers
 	 * @return nil|table {pointer = "left"|"right", left = hand, right = hand}, where hand is
 	 *   {valid, trigger, grip, stickX, stickY, primary (A/X), secondary (B/Y), stickClick,
-	 *   holds = "table"|"panel"|""}; nil while no headset session runs
+	 *   holds = "table"|"panel"|""}, and uiX, uiY (canvas px) while the pointer
+	 *   is on a VR UI panel; nil while no headset session runs
 	 */
 	int GetVRControllers(lua_State* L)
 	{
@@ -248,6 +249,10 @@ namespace {
 			LuaPushNamedBool(L, "stickClick", hi.stickClick);
 			LuaPushNamedString(L, "holds", std::string((VRState::handHolds[h] == 1) ? "table" : (VRState::handHolds[h] == 2) ? "panel" : ""));
 			lua_rawset(L, -3);
+		}
+		if (VRState::uiPointerOn) {
+			LuaPushNamedNumber(L, "uiX", VRState::uiPointerX);
+			LuaPushNamedNumber(L, "uiY", VRState::uiPointerY);
 		}
 		return 1;
 	}
