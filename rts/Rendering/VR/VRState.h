@@ -128,10 +128,10 @@ namespace VRState {
 	// window pixels) that LuaUI asks to show as panels of their own in the
 	// headset (Spring.SetVRPanels, see VRLua.cpp). The pointer clicks them
 	// like the desktop panel. Every change bumps uiPanelsVersion.
-	enum UIPanelAnchor { UI_ANCHOR_BAR = 0, UI_ANCHOR_PALETTE = 1, UI_ANCHOR_SIDE = 2, UI_ANCHOR_CENTER = 3, UI_ANCHOR_WALL = 4 };
+	enum UIPanelAnchor { UI_ANCHOR_BAR = 0, UI_ANCHOR_PALETTE = 1, UI_ANCHOR_SIDE = 2, UI_ANCHOR_CENTER = 3, UI_ANCHOR_WALL = 4, UI_ANCHOR_RADIAL = 5 };
 	struct UIPanelRequest {
 		std::string name;
-		int anchor = UI_ANCHOR_BAR; // bar: on the table's far edge; palette: over the off hand; side: by the pointer hand; center: in front of you; wall: beside the TV
+		int anchor = UI_ANCHOR_BAR; // bar: on the table's far edge; palette: over the off hand; side: by the pointer hand; center: in front of you; wall: beside the TV; radial: at the pointer hand
 		float widthM = 0.0f;        // physical width in metres; 0 = the anchor's default metres per pixel
 		bool canvas = false;        // source "vr": a rectangle of the VR UI canvas (RmlUi "vr_" contexts, see VRRml.h), not the desktop frame
 		bool hidden = false;        // kept (with its swapchain) but not shown, so showing it later is instant
@@ -153,6 +153,24 @@ namespace VRState {
 	// is the active controller (the menu, the loading screen, pregame)
 	inline bool sessionRunning = false;
 	inline bool menuView = false;
+
+	// controller vibrations asked for by LuaUI (Spring.VRHaptic), sent by
+	// CVRManager on its next frame. hand: 0 left, 1 right
+	struct HapticRequest {
+		int hand = 0;
+		float amplitude = 0.5f;
+		float seconds = 0.02f;
+	};
+	inline std::vector<HapticRequest> haptics;
+
+	// panels the player moved by hand stay where they were put (saved in
+	// VRPanelPins); LuaUI can put them back (Spring.ResetVRPanels): a name, or
+	// "*" for all. CVRManager handles the requests on its next frame.
+	inline std::vector<std::string> pinResets;
+	// the names of the pinned panels, mirrored by CVRManager for LuaUI
+	inline std::vector<std::string> pinnedNames;
+	// what each hand's grip holds: 0 nothing, 1 the table, 2 a panel
+	inline int handHolds[2] = {0, 0};
 
 	// the headset's view in world space (head position, axes, and the tangents
 	// of the field of view both eyes together cover), set by CVRManager::DrawEyes

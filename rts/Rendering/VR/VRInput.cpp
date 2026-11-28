@@ -2,6 +2,7 @@
 
 #include "VRInput.h"
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -61,7 +62,8 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 	    !MakeAction(thumbstickAction, XR_ACTION_TYPE_VECTOR2F_INPUT, "thumbstick", "Thumbstick") ||
 	    !MakeAction(commandAction, XR_ACTION_TYPE_BOOLEAN_INPUT, "command", "Command (right click)") ||
 	    !MakeAction(stickClickAction, XR_ACTION_TYPE_BOOLEAN_INPUT, "pointer_hand", "Point with this hand") ||
-	    !MakeAction(secondaryAction, XR_ACTION_TYPE_BOOLEAN_INPUT, "modifier", "Ctrl (off hand) / Alt (pointer hand)")) {
+	    !MakeAction(secondaryAction, XR_ACTION_TYPE_BOOLEAN_INPUT, "modifier", "Ctrl (off hand) / Alt (pointer hand)") ||
+	    !MakeAction(hapticAction, XR_ACTION_TYPE_VIBRATION_OUTPUT, "haptic", "Vibration")) {
 		Destroy();
 		return false;
 	}
@@ -95,6 +97,7 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 		{aimPoseAction, "/input/aim/pose"},
 		{triggerAction, "/input/select/click"},
 		{commandAction, "/input/menu/click"},
+		{hapticAction, "/output/haptic"},
 	});
 	Suggest("/interaction_profiles/oculus/touch_controller", {
 		{gripPoseAction, "/input/grip/pose"},
@@ -107,6 +110,7 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 		{stickClickAction, "/input/thumbstick/click"},
 		{secondaryAction, "/input/y/click", 1},
 		{secondaryAction, "/input/b/click", 2},
+		{hapticAction, "/output/haptic"},
 	});
 	Suggest("/interaction_profiles/valve/index_controller", {
 		{gripPoseAction, "/input/grip/pose"},
@@ -117,6 +121,7 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 		{commandAction, "/input/a/click"},
 		{stickClickAction, "/input/thumbstick/click"},
 		{secondaryAction, "/input/b/click"},
+		{hapticAction, "/output/haptic"},
 	});
 	Suggest("/interaction_profiles/htc/vive_controller", {
 		{gripPoseAction, "/input/grip/pose"},
@@ -125,6 +130,7 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 		{triggerAction, "/input/trigger/value"},
 		{thumbstickAction, "/input/trackpad"},
 		{commandAction, "/input/trackpad/click"},
+		{hapticAction, "/output/haptic"},
 	});
 	Suggest("/interaction_profiles/microsoft/motion_controller", {
 		{gripPoseAction, "/input/grip/pose"},
@@ -134,6 +140,7 @@ bool CVRInput::Init(XrInstance instance, XrSession session)
 		{thumbstickAction, "/input/thumbstick"},
 		{commandAction, "/input/trackpad/click"},
 		{stickClickAction, "/input/thumbstick/click"},
+		{hapticAction, "/output/haptic"},
 	});
 
 	for (int h = 0; h < NUM_HANDS; ++h) {
@@ -194,6 +201,25 @@ void CVRInput::Destroy()
 	commandAction = XR_NULL_HANDLE;
 	stickClickAction = XR_NULL_HANDLE;
 	secondaryAction = XR_NULL_HANDLE;
+	hapticAction = XR_NULL_HANDLE;
+}
+
+
+void CVRInput::Pulse(XrSession session, int hand, float amplitude, float seconds) const
+{
+	if (hapticAction == XR_NULL_HANDLE || hand < 0 || hand >= NUM_HANDS)
+		return;
+
+	XrHapticActionInfo info = {XR_TYPE_HAPTIC_ACTION_INFO};
+	info.action = hapticAction;
+	info.subactionPath = handPaths[hand];
+
+	XrHapticVibration vibration = {XR_TYPE_HAPTIC_VIBRATION};
+	vibration.amplitude = std::clamp(amplitude, 0.0f, 1.0f);
+	vibration.duration = static_cast<XrDuration>(std::clamp(seconds, 0.001f, 1.0f) * 1e9f);
+	vibration.frequency = XR_FREQUENCY_UNSPECIFIED;
+
+	xrApplyHapticFeedback(session, &info, reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
 }
 
 

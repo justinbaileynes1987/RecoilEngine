@@ -39,6 +39,9 @@ public:
 
 	const VRHandState& Hand(int i) const { return hands[i]; }
 
+	// a vibration on hand i: amplitude 0..1 for the given seconds
+	void Pulse(XrSession session, int hand, float amplitude, float seconds) const;
+
 private:
 	XrActionSet actionSet = XR_NULL_HANDLE;
 	XrAction gripPoseAction = XR_NULL_HANDLE;
@@ -49,6 +52,7 @@ private:
 	XrAction commandAction = XR_NULL_HANDLE;
 	XrAction stickClickAction = XR_NULL_HANDLE;
 	XrAction secondaryAction = XR_NULL_HANDLE;
+	XrAction hapticAction = XR_NULL_HANDLE;
 
 	XrPath handPaths[NUM_HANDS] = {XR_NULL_PATH, XR_NULL_PATH};
 	XrSpace gripSpaces[NUM_HANDS] = {XR_NULL_HANDLE, XR_NULL_HANDLE};

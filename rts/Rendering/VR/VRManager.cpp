@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -72,6 +73,7 @@ CONFIG(float, VRPaletteScale).defaultValue(0.0005f).minimumValue(0.0001f).descri
 CONFIG(float, VRSideAngle).defaultValue(40.0f).description("Zero-K VR: how far round to the pointer hand's side (it swaps with the pointer) the side UI panel (orders, build menu) sits, in degrees from where you face.");
 CONFIG(float, VRSideDistance).defaultValue(0.6f).minimumValue(0.2f).description("Zero-K VR: distance in metres from your head to the side UI panel.");
 CONFIG(float, VRSideHeight).defaultValue(-0.35f).description("Zero-K VR: height in metres of the side UI panel's centre relative to your eyes.");
+CONFIG(std::string, VRPanelPins).defaultValue("").description("Zero-K VR: UI panels the player moved by hand (grip while pointing at one), and where: name x y z qx qy qz qw width; ... in the headset's LOCAL space. Set by the engine; empty puts every panel in its anchor.");
 CONFIG(float, VRSideMaxAngle).defaultValue(100.0f).description("Zero-K VR: the side UI panel swings further round to your side, up to this many degrees from where you face, when it would hide the table from your eyes.");
 CONFIG(float, VRPaletteRaise).defaultValue(0.5f).description("Zero-K VR: the off-hand palette (quick orders) floats over the off hand, facing your eyes, while that hand is raised higher than this many metres below your eyes and is in front of you.");
 
@@ -284,6 +286,34 @@ struct CVRManager::Impl
 
 	void UpdateTable();
 	void SaveTable() const;
+
+	// panels moved by hand: a grip while that hand's ray points at a UI panel
+	// grabs the panel instead of the table; where it is let go it stays
+	// (pinned, in LOCAL space), saved in VRPanelPins
+	struct PanelPin {
+		std::string name;
+		float3 pos;
+		XrQuaternionf q = {0.0f, 0.0f, 0.0f, 1.0f};
+		float width = 0.5f;
+	};
+	std::vector<PanelPin> pins;
+	bool pinsChanged = false;
+	bool gripDown[2] = {false, false};    // each grip, with hysteresis
+	std::string panelGrab[2];             // the panel each hand holds ("": none)
+	float3 panelGrabRel[2];               // its centre in the hand's aim frame
+	PanelPin* FindPin(const std::string& name) {
+		for (PanelPin& p: pins) {
+			if (p.name == name)
+				return &p;
+		}
+		return nullptr;
+	}
+	void UpdatePanelGrab(const bool held[2]);
+	void LoadPins();
+	void SavePins() const;
+	void MirrorPins() const;
+	XrQuaternionf FacingHead(const float3& c, float yawIfLevel) const;
+	void LayoutAnchors();
 
 	// controller pointer as the mouse (table view, in-game)
 	bool pointerEnabled = true;
@@ -1072,13 +1102,22 @@ void CVRManager::Impl::UpdateTable()
 	if (!tableView || !inputReady)
 		return;
 
-	int mask = 0;
+	bool held[CVRInput::NUM_HANDS] = {};
 	for (int h = 0; h < CVRInput::NUM_HANDS; ++h) {
 		const VRHandState& hand = input.Hand(h);
-		const bool wasHeld = ((grabMask >> h) & 1) != 0;
 		// hysteresis so a half-pressed grip does not flicker
-		const bool held = hand.gripValid && (hand.squeeze > (wasHeld ? 0.35f : 0.65f));
-		mask |= (held ? 1 : 0) << h;
+		held[h] = hand.gripValid && (hand.squeeze > (gripDown[h] ? 0.35f : 0.65f));
+	}
+
+	// a grip pointing at a panel takes the panel, not the table
+	UpdatePanelGrab(held);
+
+	int mask = 0;
+	for (int h = 0; h < CVRInput::NUM_HANDS; ++h) {
+		gripDown[h] = held[h];
+		const bool holdsTable = held[h] && panelGrab[h].empty();
+		mask |= (holdsTable ? 1 : 0) << h;
+		VRState::handHolds[h] = !panelGrab[h].empty() ? 2 : (holdsTable ? 1 : 0);
 	}
 
 	const float3 leftPos = ToF3(input.Hand(0).grip.position);
@@ -1129,6 +1168,146 @@ void CVRManager::Impl::UpdateTable()
 	}
 
 	tableMoved = true;
+}
+
+
+// a grip pressed while that hand's ray points at a UI panel (any but the
+// PDA and the radial menu) grabs it: the panel follows the hand, turned to
+// face the eyes; the grabbing hand's thumbstick pushes it away or pulls it
+// in (up / down) and makes it bigger or smaller (right / left). Let go, and
+// it stays there (in the room) until LuaUI puts it back (Spring.ResetVRPanels).
+void CVRManager::Impl::UpdatePanelGrab(const bool held[2])
+{
+	const float dt = std::clamp(static_cast<float>(frameState.predictedDisplayPeriod) * 1e-9f, 0.001f, 0.05f);
+
+	for (int h = 0; h < CVRInput::NUM_HANDS; ++h) {
+		const VRHandState& hand = input.Hand(h);
+
+		// let go
+		if (!held[h]) {
+			if (!panelGrab[h].empty()) {
+				LOG("[VR] panel %s pinned", panelGrab[h].c_str());
+				input.Pulse(session, h, 0.4f, 0.02f);
+				panelGrab[h].clear();
+				MirrorPins();
+			}
+			continue;
+		}
+
+		// a new grip: does this hand's ray point at a panel?
+		if (!gripDown[h] && panelGrab[h].empty() && hand.aimValid && !menuView) {
+			const float3 from = ToF3(hand.aim.position);
+			const float3 dir = ToF3(Rotate(hand.aim.orientation, {0.0f, 0.0f, -1.0f}));
+			const UIPanelLayer* best = nullptr;
+			float bestT = 0.0f;
+			for (const UIPanelLayer& layer: uiLayers) {
+				if (!layer.visible || !layer.drawn || layer.anchor == VRState::UI_ANCHOR_PALETTE || layer.anchor == VRState::UI_ANCHOR_RADIAL)
+					continue;
+				float t = 0.0f, u = 0.0f, v = 0.0f;
+				if (RayQuad(layer.quad, from, dir, t, u, v) && (best == nullptr || t < bestT)) {
+					best = &layer;
+					bestT = t;
+				}
+			}
+			const int other = 1 - h;
+			if (best != nullptr && panelGrab[other] != best->name) {
+				PanelPin* pin = FindPin(best->name);
+				if (pin == nullptr) {
+					pins.push_back(PanelPin());
+					pin = &pins.back();
+					pin->name = best->name;
+				}
+				pin->pos = ToF3(best->quad.pose.position);
+				pin->q = best->quad.pose.orientation;
+				pin->width = best->quad.width;
+				const XrQuaternionf inv = {-hand.aim.orientation.x, -hand.aim.orientation.y, -hand.aim.orientation.z, hand.aim.orientation.w};
+				panelGrabRel[h] = ToF3(Rotate(inv, ToXr(pin->pos - from)));
+				panelGrab[h] = best->name;
+				LOG("[VR] panel %s grabbed", best->name.c_str());
+				input.Pulse(session, h, 0.6f, 0.03f);
+				MirrorPins();
+			}
+			continue;
+		}
+
+		// holding: follow the hand
+		PanelPin* pin = panelGrab[h].empty() ? nullptr : FindPin(panelGrab[h]);
+		if (pin == nullptr || !hand.aimValid)
+			continue;
+
+		constexpr float DEADZONE = 0.3f;
+		const float sy = hand.thumbstick.y;
+		const float sx = hand.thumbstick.x;
+		if (std::abs(sy) > DEADZONE) {
+			const float len = panelGrabRel[h].Length();
+			const float want = std::clamp(len * (1.0f + sy * 1.2f * dt), 0.15f, 4.0f);
+			if (len > 1e-3f)
+				panelGrabRel[h] *= want / len;
+		}
+		if (std::abs(sx) > DEADZONE)
+			pin->width = std::clamp(pin->width * (1.0f + sx * 0.8f * dt), 0.08f, 3.0f);
+
+		pin->pos = ToF3(hand.aim.position) + ToF3(Rotate(hand.aim.orientation, ToXr(panelGrabRel[h])));
+		pin->q = FacingHead(pin->pos, 0.0f);
+		pinsChanged = true;
+	}
+}
+
+
+// a panel's orientation at c facing the eyes (+z towards the head), leaning
+// back as far as the head is above it
+XrQuaternionf CVRManager::Impl::FacingHead(const float3& c, float yawIfLevel) const
+{
+	if (!viewsValid)
+		return QuatAxisAngle(UpVector, yawIfLevel);
+	const float3 head = (ToF3(views[0].pose.position) + ToF3(views[1].pose.position)) * 0.5f;
+	float3 flat = head - c;
+	flat.y = 0.0f;
+	const float yaw = (flat.SqLength() > 1e-6f) ? YawOf(-flat) : yawIfLevel;
+	const float3 n = (head - c).SafeNormalize();
+	const float lean = std::asin(std::clamp(n.y, -0.95f, 0.95f));
+	return QuatMul(QuatAxisAngle(UpVector, yaw), QuatAxisAngle(float3(1.0f, 0.0f, 0.0f), -lean));
+}
+
+
+void CVRManager::Impl::MirrorPins() const
+{
+	VRState::pinnedNames.clear();
+	for (const PanelPin& p: pins)
+		VRState::pinnedNames.push_back(p.name);
+}
+
+
+void CVRManager::Impl::LoadPins()
+{
+	pins.clear();
+	std::istringstream all(configHandler->GetString("VRPanelPins"));
+	std::string item;
+	while (std::getline(all, item, ';')) {
+		std::istringstream in(item);
+		PanelPin p;
+		if (in >> p.name >> p.pos.x >> p.pos.y >> p.pos.z >> p.q.x >> p.q.y >> p.q.z >> p.q.w >> p.width) {
+			p.width = std::clamp(p.width, 0.08f, 3.0f);
+			pins.push_back(p);
+		}
+	}
+	MirrorPins();
+	if (!pins.empty())
+		LOG("[VR] %d panel(s) pinned where the player put them", static_cast<int>(pins.size()));
+}
+
+
+void CVRManager::Impl::SavePins() const
+{
+	if (!pinsChanged)
+		return;
+	std::ostringstream out;
+	for (const PanelPin& p: pins) {
+		out << p.name << ' ' << p.pos.x << ' ' << p.pos.y << ' ' << p.pos.z << ' '
+		    << p.q.x << ' ' << p.q.y << ' ' << p.q.z << ' ' << p.q.w << ' ' << p.width << ';';
+	}
+	configHandler->SetString("VRPanelPins", out.str());
+	LOG("[VR] saved %d pinned panel(s)", static_cast<int>(pins.size()));
 }
 
 
@@ -1328,6 +1507,76 @@ void CVRManager::Impl::EnsureUISwapchains()
 //  - palette: over the off hand's controller, facing the eyes, bottom to top
 //    in list order, shown while that hand is raised in front of you
 void CVRManager::Impl::LayoutUIPanels()
+{
+	// LuaUI put panels back in their anchors
+	if (!VRState::pinResets.empty()) {
+		for (const std::string& name: VRState::pinResets) {
+			const size_t before = pins.size();
+			pins.erase(std::remove_if(pins.begin(), pins.end(), [&](const PanelPin& p) {
+				return (name == "*" || p.name == name) && p.name != panelGrab[0] && p.name != panelGrab[1];
+			}), pins.end());
+			if (pins.size() != before) {
+				pinsChanged = true;
+				LOG("[VR] panel pins reset (%s)", name.c_str());
+			}
+		}
+		VRState::pinResets.clear();
+		MirrorPins();
+	}
+
+	// pinned panels sit out of their anchors' layout (as if hidden there), then
+	// take the place they were put in
+	std::vector<size_t> pinned;
+	if (!menuView) {
+		for (size_t i = 0; i < uiLayers.size(); ++i) {
+			UIPanelLayer& layer = uiLayers[i];
+			if (!layer.hidden && layer.anchor != VRState::UI_ANCHOR_PALETTE && layer.anchor != VRState::UI_ANCHOR_RADIAL && FindPin(layer.name) != nullptr) {
+				pinned.push_back(i);
+				layer.hidden = true;
+			}
+		}
+	}
+
+	LayoutAnchors();
+
+	for (const size_t i: pinned)
+		uiLayers[i].hidden = false;
+
+	if (!HaveUIPanels())
+		return;
+
+	for (const size_t i: pinned) {
+		UIPanelLayer& layer = uiLayers[i];
+		const PanelPin* pin = FindPin(layer.name);
+		layer.quad.pose.orientation = pin->q;
+		layer.quad.pose.position = ToXr(pin->pos);
+		layer.quad.width = pin->width;
+		layer.quad.height = pin->width * static_cast<float>(layer.h) / static_cast<float>(std::max(layer.w, 1));
+		layer.visible = true;
+	}
+
+	// the radial menu: just in front of and above the pointer hand, facing the eyes
+	const VRHandState& hand = input.Hand(pointerHand);
+	if (hand.aimValid && viewsValid) {
+		for (UIPanelLayer& layer: uiLayers) {
+			if (layer.anchor != VRState::UI_ANCHOR_RADIAL || layer.hidden)
+				continue;
+			const float w = layer.w * Scale(layer, paletteScale);
+			const float h = layer.h * Scale(layer, paletteScale);
+			const float3 fwd = ToF3(Rotate(hand.aim.orientation, {0.0f, 0.0f, -1.0f}));
+			const float3 c = ToF3(hand.aim.position) + fwd * 0.08f + UpVector * (0.04f + h * 0.5f);
+			layer.quad.pose.orientation = FacingHead(c, 0.0f);
+			layer.quad.pose.position = ToXr(c);
+			layer.quad.width = w;
+			layer.quad.height = h;
+			layer.visible = true;
+		}
+	}
+}
+
+
+// places the anchored UI panels (see LayoutUIPanels for pinned and radial ones)
+void CVRManager::Impl::LayoutAnchors()
 {
 	HideUIPanels();
 
@@ -1756,6 +2005,10 @@ void CVRManager::Impl::UpdatePointer()
 
 	pointerHit = 0;
 
+	for (const VRState::HapticRequest& r: VRState::haptics)
+		input.Pulse(session, r.hand, r.amplitude, r.seconds);
+	VRState::haptics.clear();
+
 	// debounce the buttons and find this frame's presses
 	bool pressed[CVRInput::NUM_HANDS][3] = {};
 	for (int h = 0; h < CVRInput::NUM_HANDS; ++h) {
@@ -1899,7 +2152,7 @@ void CVRManager::Impl::UpdatePointer()
 			}
 
 			for (const UIPanelLayer& layer: uiLayers) {
-				if (layer.visible && layer.drawn && TryPanel(layer.quad, layer.x, layer.y, layer.w, layer.h, layer.canvas))
+				if (layer.visible && layer.drawn && layer.anchor != VRState::UI_ANCHOR_RADIAL && TryPanel(layer.quad, layer.x, layer.y, layer.w, layer.h, layer.canvas))
 					hitPanel = &layer;
 			}
 
@@ -1931,6 +2184,7 @@ void CVRManager::Impl::UpdatePointer()
 			if (wants[b] && !uiButtons[b] && onCanvas) {
 				VRRml::PointerButton(b, true);
 				uiButtons[b] = true;
+				input.Pulse(session, pointerHand, 0.35f, 0.012f);
 			} else if (!wants[b] && uiButtons[b]) {
 				VRRml::PointerButton(b, false);
 				uiButtons[b] = false;
@@ -2240,6 +2494,7 @@ void CVRManager::Init()
 	impl->sideDistance = configHandler->GetFloat("VRSideDistance");
 	impl->sideHeight = configHandler->GetFloat("VRSideHeight");
 	impl->sideMaxAngle = std::max(configHandler->GetFloat("VRSideMaxAngle") * 0.0174533f, impl->sideAngle);
+	impl->LoadPins();
 
 	if (impl->CreateInstance() && impl->CreateSession() && impl->CreateSwapchains()) {
 		LOG("[VR] OpenXR session created (stereo=%d, view=%s); waiting for the runtime to start it", impl->stereo, impl->tableView ? "table" : "camera");
@@ -2255,6 +2510,7 @@ void CVRManager::Kill()
 {
 	VRPointer::Release();
 	impl->SaveTable();
+	impl->SavePins();
 	impl->Destroy();
 }
 
