@@ -1400,7 +1400,7 @@ void CVRManager::Impl::SyncUIPanels()
 		layer.h = y1 - y0;
 		layer.metresPerPixel = (req.widthM > 0.0f) ? req.widthM / static_cast<float>(layer.w) : 0.0f;
 
-		summary += " " + layer.name + (layer.hidden ? "[hidden]" : "") + ((layer.anchor == VRState::UI_ANCHOR_PALETTE) ? "(palette " : (layer.anchor == VRState::UI_ANCHOR_SIDE) ? "(side " : (layer.anchor == VRState::UI_ANCHOR_CENTER) ? "(center " : (layer.anchor == VRState::UI_ANCHOR_WALL) ? "(wall " : "(bar ") + std::to_string(layer.w) + "x" + std::to_string(layer.h) + ")";
+		summary += " " + layer.name + (layer.hidden ? "[hidden]" : "") + ((layer.anchor == VRState::UI_ANCHOR_PALETTE) ? "(palette " : (layer.anchor == VRState::UI_ANCHOR_SIDE) ? "(side " : (layer.anchor == VRState::UI_ANCHOR_CENTER) ? "(center " : (layer.anchor == VRState::UI_ANCHOR_WALL) ? "(wall " : (layer.anchor == VRState::UI_ANCHOR_RADIAL) ? "(radial " : "(bar ") + std::to_string(layer.w) + "x" + std::to_string(layer.h) + ")";
 		next.push_back(std::move(layer));
 	}
 
