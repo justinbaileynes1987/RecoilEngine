@@ -128,10 +128,10 @@ namespace VRState {
 	// window pixels) that LuaUI asks to show as panels of their own in the
 	// headset (Spring.SetVRPanels, see VRLua.cpp). The pointer clicks them
 	// like the desktop panel. Every change bumps uiPanelsVersion.
-	enum UIPanelAnchor { UI_ANCHOR_BAR = 0, UI_ANCHOR_PALETTE = 1, UI_ANCHOR_SIDE = 2, UI_ANCHOR_CENTER = 3 };
+	enum UIPanelAnchor { UI_ANCHOR_BAR = 0, UI_ANCHOR_PALETTE = 1, UI_ANCHOR_SIDE = 2, UI_ANCHOR_CENTER = 3, UI_ANCHOR_WALL = 4 };
 	struct UIPanelRequest {
 		std::string name;
-		int anchor = UI_ANCHOR_BAR; // bar: on the table's far edge; palette: over the off hand; side: by the pointer hand; center: in front of you
+		int anchor = UI_ANCHOR_BAR; // bar: on the table's far edge; palette: over the off hand; side: by the pointer hand; center: in front of you; wall: beside the TV
 		float widthM = 0.0f;        // physical width in metres; 0 = the anchor's default metres per pixel
 		bool canvas = false;        // source "vr": a rectangle of the VR UI canvas (RmlUi "vr_" contexts, see VRRml.h), not the desktop frame
 		bool hidden = false;        // kept (with its swapchain) but not shown, so showing it later is instant

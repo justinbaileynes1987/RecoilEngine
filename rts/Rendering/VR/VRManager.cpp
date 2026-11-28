@@ -1221,7 +1221,7 @@ void CVRManager::Impl::SyncUIPanels()
 		layer.h = y1 - y0;
 		layer.metresPerPixel = (req.widthM > 0.0f) ? req.widthM / static_cast<float>(layer.w) : 0.0f;
 
-		summary += " " + layer.name + (layer.hidden ? "[hidden]" : "") + ((layer.anchor == VRState::UI_ANCHOR_PALETTE) ? "(palette " : (layer.anchor == VRState::UI_ANCHOR_SIDE) ? "(side " : (layer.anchor == VRState::UI_ANCHOR_CENTER) ? "(center " : "(bar ") + std::to_string(layer.w) + "x" + std::to_string(layer.h) + ")";
+		summary += " " + layer.name + (layer.hidden ? "[hidden]" : "") + ((layer.anchor == VRState::UI_ANCHOR_PALETTE) ? "(palette " : (layer.anchor == VRState::UI_ANCHOR_SIDE) ? "(side " : (layer.anchor == VRState::UI_ANCHOR_CENTER) ? "(center " : (layer.anchor == VRState::UI_ANCHOR_WALL) ? "(wall " : "(bar ") + std::to_string(layer.w) + "x" + std::to_string(layer.h) + ")";
 		next.push_back(std::move(layer));
 	}
 
@@ -1428,7 +1428,6 @@ void CVRManager::Impl::LayoutUIPanels()
 		if (totalH > 0.0f && viewsValid) {
 			constexpr float SIDE_DEADZONE = 20.0f * 0.0174533f;
 			constexpr float GAP = 0.015f;
-			constexpr float LEAN = 20.0f * 0.0174533f;
 
 			float3 fwd = ToF3(Rotate(views[0].pose.orientation, {0.0f, 0.0f, -1.0f}));
 			fwd.y = 0.0f;
@@ -1494,8 +1493,17 @@ void CVRManager::Impl::LayoutUIPanels()
 				p.yaw = sideYaw + sideSign * angle;
 				p.base = sidePos + RotY(float3(0.0f, 0.0f, -1.0f), p.yaw) * sideDistance;
 				p.base.y = sidePos.y + sideHeight + lift;
-				// faces the head: its +z points back towards it
-				p.q = QuatMul(QuatAxisAngle(UpVector, p.yaw), QuatAxisAngle(float3(1.0f, 0.0f, 0.0f), -LEAN));
+				// turned to face the eyes where they are now, as the palette is: its
+				// +z points at the head, leaning back as far as the head is above it.
+				// The anchor follows the head lazily and holds still while in use, so
+				// a fixed angle went askew as you walked through the battlefield and
+				// read badly (2026-11-28); facing the eyes keeps it square to you.
+				float3 toHeadFlat = head - p.base;
+				toHeadFlat.y = 0.0f;
+				const float faceYaw = (toHeadFlat.SqLength() > 1e-6f) ? YawOf(-toHeadFlat) : p.yaw;
+				const float3 n = (head - p.base).SafeNormalize();
+				const float lean = std::asin(std::clamp(n.y, -0.95f, 0.95f));
+				p.q = QuatMul(QuatAxisAngle(UpVector, faceYaw), QuatAxisAngle(float3(1.0f, 0.0f, 0.0f), -lean));
 				return p;
 			};
 
@@ -1624,6 +1632,54 @@ void CVRManager::Impl::LayoutUIPanels()
 				layer.quad.height = h;
 				layer.visible = true;
 				y -= h + GAP;
+			}
+		}
+	}
+
+	// wall panels (the window, when the player hangs it on the wall): on the
+	// war-room wall to the left of the TV, facing the room like the TV, fixed
+	// in the room. Grown by the TV's distance over a centre panel's, so they
+	// look as big from where you start as the window in front of you does.
+	{
+		constexpr float CENTER_DISTANCE = 0.75f; // as the centre panels
+		constexpr float GAP = 0.12f;
+		const float grow = std::max(1.0f, mirrorDistance / CENTER_DISTANCE);
+
+		float totalH = 0.0f;
+		float maxW = 0.0f;
+		for (const UIPanelLayer& layer: uiLayers) {
+			if (layer.anchor != VRState::UI_ANCHOR_WALL || layer.hidden)
+				continue;
+			totalH += layer.h * Scale(layer, sideScale) * grow;
+			maxW = std::max(maxW, layer.w * Scale(layer, sideScale) * grow);
+		}
+
+		if (totalH > 0.0f) {
+			float3 tvCenter;
+			float tvW = 0.0f;
+			float tvH = 0.0f;
+			PanelRect(true, tvCenter, tvW, tvH);
+
+			// level with the TV's middle, but never with its bottom below the floor
+			// grid's reach: at most 1.2 m below the eyes
+			const float midY = std::max(tvCenter.y, -1.2f + totalH * 0.5f);
+			const float x = tvCenter.x - tvW * 0.5f - GAP - maxW * 0.5f;
+			const XrQuaternionf q = {0.0f, 0.0f, 0.0f, 1.0f};
+
+			float y = midY + totalH * 0.5f;
+			for (UIPanelLayer& layer: uiLayers) {
+				if (layer.anchor != VRState::UI_ANCHOR_WALL || layer.hidden)
+					continue;
+
+				const float w = layer.w * Scale(layer, sideScale) * grow;
+				const float h = layer.h * Scale(layer, sideScale) * grow;
+
+				layer.quad.pose.orientation = q;
+				layer.quad.pose.position = ToXr(float3(x, y - h * 0.5f, tvCenter.z));
+				layer.quad.width = w;
+				layer.quad.height = h;
+				layer.visible = true;
+				y -= h + 0.015f;
 			}
 		}
 	}
